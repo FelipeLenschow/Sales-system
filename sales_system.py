@@ -134,23 +134,22 @@ class ProductDatabase:
             return sorted(self.df[shop, column].dropna().unique().astype(str).tolist())
         return sorted(self.df['Todas', column].dropna().unique().astype(str).tolist())
 
-    def get_product_by_barcode_and_shop(self, barcode, shop):
-        """Busca um produto pelo código de barras para a sorveteria atual."""
+    def get_products_by_barcode_and_shop(self, barcode, shop):
+        """Busca todos os produtos pelo código de barras para a sorveteria atual."""
         try:
             # Filtrar pelo código de barras
-            product = self.df[self.df['Todas', 'Codigo de Barras'].str.strip() == barcode.strip()]
+            products = self.df[self.df['Todas', 'Codigo de Barras'].str.strip() == barcode.strip()]
 
-            # Verificar se o produto já existe na sorveteria atual
-            if not product.empty and (shop, 'Preco') in self.df.columns:
-                preco = product[(shop, 'Preco')].values[0]
-                if pd.notna(preco):  # Produto encontrado na sorveteria atual
-                    return product.iloc[0]
+            # Filtrar produtos com preço definido na loja atual
+            products = products[pd.notna(products[(shop, 'Preco')])]
 
-            # Se não existir na sorveteria atual, retornar None
-            return None
+            if not products.empty:
+                return products
+            else:
+                return pd.DataFrame()
         except Exception as e:
-            messagebox.showerror("Erro", f"Erro ao buscar produto: {e}")
-            return None
+            messagebox.showerror("Erro", f"Erro ao buscar produtos: {e}")
+            return pd.DataFrame()
 
     def get_products_by_barcode(self, barcode):
         """Retorna todos os produtos com o código de barras especificado em qualquer loja."""
@@ -191,9 +190,9 @@ class Sale:
         return self.final_price
 
     def add_product(self, product):
-        barcode = product[('Todas', 'Codigo de Barras')]
-        if barcode not in self.current_sale:
-            self.current_sale[barcode] = {
+        excel_row = product[('Metadata', 'Excel Row')]
+        if excel_row not in self.current_sale:
+            self.current_sale[excel_row] = {
                 'categoria': product[('Todas', 'Categoria')],
                 'sabor': product[('Todas', 'Sabor')],
                 'preco': product[(self.shop, 'Preco')],  # Já é float
@@ -202,17 +201,17 @@ class Sale:
                 'quantidade': 1
             }
         else:
-            self.current_sale[barcode]['quantidade'] += 1
+            self.current_sale[excel_row]['quantidade'] += 1
 
-    def remove_product(self, barcode):
-        if barcode in self.current_sale:
-            del self.current_sale[barcode]
+    def remove_product(self, excel_row):
+        if excel_row in self.current_sale:
+            del self.current_sale[excel_row]
 
-    def update_quantity(self, barcode, quantity):
-        if barcode in self.current_sale:
-            self.current_sale[barcode]['quantidade'] = max(quantity, 0)
-            if self.current_sale[barcode]['quantidade'] == 0:
-                self.remove_product(barcode)
+    def update_quantity(self, excel_row, quantity):
+        if excel_row in self.current_sale:
+            self.current_sale[excel_row]['quantidade'] = max(quantity, 0)
+            if self.current_sale[excel_row]['quantidade'] == 0:
+                self.remove_product(excel_row)
 
 
 class POSApplication:
@@ -511,35 +510,82 @@ class POSApplication:
         print(f"Handling barcode: '{barcode}'")
         current_shop = self.selected_shop_var.get()
 
-        # Tenta obter o produto na loja atual
-        product = self.product_db.get_product_by_barcode_and_shop(barcode, current_shop)
+        # Obtém todos os produtos com o mesmo código de barras na loja atual
+        matching_products = self.product_db.get_products_by_barcode_and_shop(barcode, current_shop)
+        print(matching_products)
 
-        if product is not None:
-            self.sale.add_product(product)
-            self.update_sale_display(focus_barcode=barcode)
-        else:
-            # Verifica se o produto existe em outras lojas
+        if matching_products.empty:
+            # Verifica se existem produtos com o mesmo barcode em outras lojas
             other_products = self.product_db.get_products_by_barcode(barcode)
-            if not other_products.empty:
-                # Encontrar a primeira loja que possui o produto
-                prefill_store = None
-                for store in self.product_db.shops:
-                    preco = other_products.iloc[0][(store, 'Preco')]
-                    if pd.notna(preco):
-                        prefill_store = store
-                        break
-
-                if prefill_store:
-                    existing_product = other_products.iloc[0]
-                    self.open_add_product_window(barcode=barcode, prefill_product=existing_product, prefill_store=prefill_store)
-                else:
-                    # Se nenhuma loja possui o Preco definido, abrir sem pré-preenchimento
-                    self.open_add_product_window(barcode=barcode)
-            else:
-                # Abre a janela de cadastro sem pré-preenchimento
+            if other_products.empty:
+                # Nenhum produto encontrado, abrir janela para adicionar novo produto
                 self.open_add_product_window(barcode=barcode)
+            else:
+                # Produtos encontrados em outras lojas, abrir janela para selecionar ou adicionar
+                self.select_product_window(other_products)
+        else:
+            if len(matching_products) == 1:
+                # Apenas um produto encontrado na loja atual, adiciona diretamente
+                product = matching_products.iloc[0]
+                self.sale.add_product(product)
+                self.update_sale_display(product=product)  # Passa o produto completo
+            else:
+                # Múltiplos produtos encontrados na loja atual, abrir seleção
+                self.select_product_window(matching_products)
 
         self.barcode_entry.delete(0, 'end')
+
+    def select_product_window(self, matching_products):
+        def on_select():
+            selected_index = listbox.curselection()
+            if selected_index:
+                selected_product = matching_products.iloc[selected_index[0]]
+                self.sale.add_product(selected_product)
+                selection_window.destroy()
+                self.update_sale_display(product=selected_product)  # Passa o produto completo
+
+        selection_window = tk.Toplevel(self.root)
+        selection_window.title("Selecione o Produto")
+        selection_window.configure(bg="#1a1a2e")
+
+        # Dimensionamento e posicionamento
+        win_width = int(600 * self.scale_factor)
+        win_height = int(400 * self.scale_factor)
+        selection_window.geometry(f"{win_width}x{win_height}")
+        selection_window.resizable(False, False)
+        selection_window.grab_set()  # Torna a janela modal
+
+        # Centralizar a janela
+        selection_window.update_idletasks()
+        x = (selection_window.winfo_screenwidth() // 2) - (win_width // 2)
+        y = (selection_window.winfo_screenheight() // 2) - (win_height // 2)
+        selection_window.geometry(f"+{x}+{y}")
+
+        # Título
+        title_font = ("Arial", int(20 * self.scale_factor), "bold")
+        tk.Label(selection_window, text="Selecione o Produto", bg="#1a1a2e", fg="#ffffff", font=title_font).pack(
+            pady=int(20 * self.scale_factor))
+
+        # Listbox com scrollbar
+        list_frame = tk.Frame(selection_window, bg="#1a1a2e")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, font=("Arial", int(14 * self.scale_factor)))
+        listbox.pack(fill=tk.BOTH, expand=True)
+        listbox.config(yscrollcommand=scrollbar.set)
+        scrollbar.config(command=listbox.yview)
+
+        # Preencher a listbox com os produtos
+        for idx, product in matching_products.iterrows():
+            listbox.insert(tk.END,
+                           f"{product[('Todas', 'Categoria')]}  {product[('Todas', 'Sabor')]}  R${product[(self.selected_shop_var.get(), 'Preco')]:.2f}")
+
+        # Botão de Seleção
+        select_button = ttk.Button(selection_window, text="Selecionar", command=on_select)
+        select_button.pack(pady=int(10 * self.scale_factor))
 
     def open_add_product_window(self, barcode=None, prefill_product=None, prefill_store=None):
         def parse_float(value):
@@ -857,7 +903,9 @@ class POSApplication:
             fg_color = "#ffffff"
         widgets['price_label'].config(text=f"R${price:.2f}", fg=fg_color)
 
-    def update_sale_display(self, focus_barcode=None):
+    def update_sale_display(self, product=None):
+        print("Adicionando produto:")
+        print(product)
         # Aplica promoções e calcula o preço final
         final_price = self.sale.apply_promotion()
         self.final_price_label.config(text=f"R${final_price:.2f}")
@@ -870,14 +918,14 @@ class POSApplication:
             self.category_quantities[category] = self.category_quantities.get(category, 0) + quantity
 
         # Atualiza widgets existentes ou cria novos
-        for barcode, details in self.sale.current_sale.items():
-            if barcode not in self.product_widgets:
-                self.create_product_widget(barcode, details)
+        for excel_row, details in self.sale.current_sale.items():
+            if excel_row not in self.product_widgets:
+                self.create_or_update_product_widget(excel_row, details)
             else:
-                widgets = self.product_widgets[barcode]
+                widgets = self.product_widgets[excel_row]
                 widgets['quantity_var'].set(str(details['quantidade']))
 
-                # Atualiza o preço
+                # Atualiza o preço com base na promoção
                 if (self.sale.payment_method in ['Pix', 'Dinheiro'] and
                         self.category_quantities.get(details['categoria'], 0) >= details['promo_qt']):
                     price = details['promo_preco']
@@ -888,21 +936,25 @@ class POSApplication:
                 widgets['price_label'].config(text=f"R${price:.2f}", fg=fg_color)
 
         # Remove widgets que não estão mais na venda
-        existing_barcodes = set(self.product_widgets.keys())
-        current_barcodes = set(self.sale.current_sale.keys())
-        for barcode in existing_barcodes - current_barcodes:
-            widgets = self.product_widgets[barcode]
+        existing_excel_rows = set(self.product_widgets.keys())
+        current_excel_rows = set(self.sale.current_sale.keys())
+        for excel_row in existing_excel_rows - current_excel_rows:
+            widgets = self.product_widgets[excel_row]
             for widget in widgets.values():
                 if isinstance(widget, (tk.Widget, ttk.Widget)):
                     widget.destroy()
-            del self.product_widgets[barcode]
+            del self.product_widgets[excel_row]
 
         # Restaurar o foco no código de barras
-        self.root.bind_all("<Return>", lambda event: (self.barcode_entry.focus(), "break")[1])
-        self.root.bind_all("<F12>", lambda event: (self.barcode_entry.focus(), "break")[1])
+        self.root.bind("<Return>", lambda event: (self.barcode_entry.focus(), "break")[1])
+        self.root.bind("<F12>", lambda event: (self.barcode_entry.focus(), "break")[1])
+        self.root.bind("<End>", lambda event: (self.barcode_entry.focus(), "break")[1])
 
-        if focus_barcode and focus_barcode in self.product_widgets:
-            self.product_widgets[focus_barcode]['quantity_entry'].focus_set()
+        # Se um produto foi passado, focar no widget de quantidade correspondente
+        if product is not None:
+            excel_row = product[('Metadata', 'Excel Row')]
+            if excel_row in self.product_widgets:
+                self.product_widgets[excel_row]['quantity_entry'].focus_set()
 
         if self.valor_pago_entry.get():
             self.calcular_troco()
