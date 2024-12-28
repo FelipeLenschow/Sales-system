@@ -9,7 +9,7 @@ from openpyxl import load_workbook, Workbook
 # Constants for UI scaling
 BASE_WIDTH = 1920
 BASE_HEIGHT = 1080
-
+Version = "0.1.1"
 
 class ProductDatabase:
     def __init__(self, filepath='produtos.xlsx'):
@@ -275,11 +275,16 @@ class POSApplication:
 
         # Fonts
         title_font = ("Arial", int(20 * self.scale_factor), "bold")
+        version_font = ("Arial", int(8 * self.scale_factor))
         combobox_font = ("Arial", int(14 * self.scale_factor))
 
         # Label
         tk.Label(shop_window, text="Selecione a loja", bg="#1a1a2e", fg="#ffffff",
-                 font=title_font).pack(pady=int(20 * self.scale_factor))
+                 font=title_font).pack(pady=int(10 * self.scale_factor))
+
+        tk.Label(shop_window, text=f"Versao: {Version}", bg="#1a1a2e", fg="#ffffff",
+                 font=version_font).pack(pady=0)
+
 
         # Combobox
         shop_combobox = ttk.Combobox(
@@ -521,8 +526,22 @@ class POSApplication:
                 # Nenhum produto encontrado, abrir janela para adicionar novo produto
                 self.open_add_product_window(barcode=barcode)
             else:
-                # Produtos encontrados em outras lojas, abrir janela para selecionar ou adicionar
-                self.select_product_window(other_products)
+                # Produtos encontrados em outras lojas, abrir janela para adicionar
+                # Encontrar a primeira loja que possui o produto
+                prefill_store = None
+                for store in self.product_db.shops:
+                    preco = other_products.iloc[0][(store, 'Preco')]
+                    if pd.notna(preco):
+                        prefill_store = store
+                        break
+
+                if prefill_store:
+                    existing_product = other_products.iloc[0]
+                    self.open_add_product_window(barcode=barcode, prefill_product=existing_product,
+                                                 prefill_store=prefill_store)
+                else:
+                    # Se nenhuma loja possui o Preco definido, abrir sem pré-preenchimento
+                    self.open_add_product_window(barcode=barcode)
         else:
             if len(matching_products) == 1:
                 # Apenas um produto encontrado na loja atual, adiciona diretamente
