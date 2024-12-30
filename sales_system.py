@@ -4,12 +4,38 @@ from tkinter import ttk, messagebox
 import pandas as pd
 from datetime import datetime
 from openpyxl import load_workbook, Workbook
+import ctypes
+import platform
 
 
 # Constants for UI scaling
 BASE_WIDTH = 1920
 BASE_HEIGHT = 1080
-Version = "0.1.1"
+Version = "0.1.3"
+
+def is_numlock_on():
+    if platform.system() != 'Windows':
+        return True  # Assume Num Lock is on for non-Windows systems
+    hllDll = ctypes.WinDLL ("User32.dll")
+    VK_NUMLOCK = 0x90
+    return hllDll.GetKeyState(VK_NUMLOCK) & 1
+
+def set_numlock(state=True):
+
+    if platform.system() != 'Windows':
+        return  # Do nothing for non-Windows systems
+
+    hllDll = ctypes.WinDLL ("User32.dll")
+    VK_NUMLOCK = 0x90
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+
+    current_state = is_numlock_on()
+    if current_state != state:
+        print("pressing NumLock")
+        # Simulate key press
+        hllDll.keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | 0, 0)
+        hllDll.keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
 
 class ProductDatabase:
     def __init__(self, filepath='produtos.xlsx'):
@@ -17,7 +43,6 @@ class ProductDatabase:
         self.load_products()
 
     def load_products(self):
-        print("Loading")
         try:
             # Tentar carregar o arquivo com MultiIndex no cabeçalho (2 linhas)
             self.df = pd.read_excel(self.filepath, header=[0, 1], dtype=str)
@@ -218,6 +243,10 @@ class POSApplication:
         self.root = root
         self.root.withdraw()  # Hide the root window initially
 
+        # Ensure Num Lock is always on
+        set_numlock(True)
+        self.root.bind_all("<Num_Lock>", lambda event: (set_numlock(state=True), "break")[1])
+
         # Screen scaling
         self.screen_width = self.root.winfo_screenwidth()
         self.screen_height = self.root.winfo_screenheight()
@@ -258,6 +287,7 @@ class POSApplication:
         shop_window = tk.Toplevel(self.root)
         shop_window.title("Selecione a loja")
         shop_window.configure(bg="#1a1a2e")
+        shop_window.attributes("-topmost", True)
 
         # Scale geometry
         win_width = int(400 * self.scale_factor)
@@ -562,7 +592,8 @@ class POSApplication:
 
         selection_window = tk.Toplevel(self.root)
         selection_window.title("Selecione o Produto")
-        selection_window.configure(bg="#1a1a2e")
+        selection_window.configure(bg="#8b0000")
+        selection_window.attributes("-topmost", True)
 
         # Dimensionamento e posicionamento
         win_width = int(600 * self.scale_factor)
@@ -579,11 +610,11 @@ class POSApplication:
 
         # Título
         title_font = ("Arial", int(20 * self.scale_factor), "bold")
-        tk.Label(selection_window, text="Selecione o Produto", bg="#1a1a2e", fg="#ffffff", font=title_font).pack(
+        tk.Label(selection_window, text="Selecione o Produto", bg="#8b0000", fg="#ffffff", font=title_font).pack(
             pady=int(20 * self.scale_factor))
 
         # Listbox com scrollbar
-        list_frame = tk.Frame(selection_window, bg="#1a1a2e")
+        list_frame = tk.Frame(selection_window, bg="#8b0000")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         scrollbar = tk.Scrollbar(list_frame)
@@ -604,7 +635,7 @@ class POSApplication:
         select_button = ttk.Button(selection_window, text="Selecionar", command=on_select)
         select_button.pack(pady=int(10 * self.scale_factor))
 
-    def open_add_product_window(self, index_excel=None, prefill_product=None, prefill_store=None):
+    def open_add_product_window(self, barcode=None, prefill_product=None, prefill_store=None):
         def parse_float(value):
             """Converte um valor para float, aceitando ',' ou '.' como separador decimal."""
             if value:
@@ -670,18 +701,19 @@ class POSApplication:
         # Criar a janela de adicionar produto
         add_product_window = tk.Toplevel(self.root)
         add_product_window.title("Adicionar/Atualizar Produto")
-        add_product_window.configure(bg="#1a1a2e")
+        add_product_window.configure(bg="#8b0000")
+        add_product_window.attributes("-topmost", True)
 
         # Frame para inputs
-        input_frame = tk.Frame(add_product_window, bg="#1a1a2e")
+        input_frame = tk.Frame(add_product_window, bg="#8b0000")
         input_frame.pack(pady=10, padx=10)
 
         # Código de Barras
-        tk.Label(input_frame, text="Código de Barras", bg="#1a1a2e", fg="#ffffff").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Código de Barras", bg="#8b0000", fg="#ffffff").grid(row=0, column=0, padx=5, pady=5, sticky="e")
         barcode_entry = ttk.Entry(input_frame)
         barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        if index_excel:
-            barcode_entry.insert(0, index_excel)
+        if barcode:
+            barcode_entry.insert(0, barcode)
 
         # Preencher campos com valores existentes, se houver
         if prefill_product is not None:
@@ -705,7 +737,7 @@ class POSApplication:
             promo_qt_value = ""
 
         # Sabor
-        tk.Label(input_frame, text="Sabor:", bg="#1a1a2e", fg="#ffffff").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Sabor:", bg="#8b0000", fg="#ffffff").grid(row=0, column=2, padx=5, pady=5, sticky="e")
         flavor_combobox = ttk.Combobox(
             input_frame,
             values=self.product_db.get_unique_values('Sabor'),
@@ -715,7 +747,7 @@ class POSApplication:
         flavor_combobox.insert(0, sabor_value)  # Preencher sabor se disponível
 
         # Categoria
-        tk.Label(input_frame, text="Categoria:", bg="#1a1a2e", fg="#ffffff").grid(row=0, column=4, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Categoria:", bg="#8b0000", fg="#ffffff").grid(row=0, column=4, padx=5, pady=5, sticky="e")
         category_combobox = ttk.Combobox(
             input_frame,
             values=self.product_db.get_unique_values('Categoria'),
@@ -725,21 +757,21 @@ class POSApplication:
         category_combobox.insert(0, categoria_value)  # Preencher categoria se disponível
 
         # Preço
-        tk.Label(input_frame, text="Preço:", bg="#1a1a2e", fg="#ffffff").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Preço:", bg="#8b0000", fg="#ffffff").grid(row=1, column=0, padx=5, pady=5, sticky="e")
         price_entry = ttk.Entry(input_frame)
         price_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         if preco_value and preco_value != "":
             price_entry.insert(0, preco_value)
 
         # Promo Preço
-        tk.Label(input_frame, text="Promo Preço:", bg="#1a1a2e", fg="#ffffff").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Promo Preço:", bg="#8b0000", fg="#ffffff").grid(row=1, column=2, padx=5, pady=5, sticky="e")
         promo_price_entry = ttk.Entry(input_frame)
         promo_price_entry.grid(row=1, column=3, padx=5, pady=5, sticky="w")
         if promo_preco_value and promo_preco_value != "":
             promo_price_entry.insert(0, promo_preco_value)
 
         # Promo Quantidade
-        tk.Label(input_frame, text="Promo Quantidade:", bg="#1a1a2e", fg="#ffffff").grid(row=1, column=4, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Promo Quantidade:", bg="#8b0000", fg="#ffffff").grid(row=1, column=4, padx=5, pady=5, sticky="e")
         promo_qty_entry = ttk.Entry(input_frame)
         promo_qty_entry.grid(row=1, column=5, padx=5, pady=5, sticky="w")
         if promo_qt_value and promo_qt_value != "":
@@ -751,16 +783,18 @@ class POSApplication:
 
     def open_manual_add_window(self):
         def search_products():
-            search_term = search_entry.get().lower()
-            self.filtered_products = self.product_db.filter_products(search_term, self.selected_shop_var.get())
-
             product_listbox.delete(0, tk.END)
-            for _, product in self.filtered_products.iterrows():
-                preco = product[(self.selected_shop_var.get(), 'Preco')]
-                product_listbox.insert(
-                    tk.END,
-                    f"{product['Todas', 'Sabor']} ({product['Todas', 'Categoria']}) - R${preco:.2f}"
-                )
+            if search_entry.get() != "":
+                search_term = search_entry.get().lower()
+                self.filtered_products = self.product_db.filter_products(search_term, self.selected_shop_var.get())
+
+                for _, product in self.filtered_products.iterrows():
+                    preco = product[(self.selected_shop_var.get(), 'Preco')]
+                    product_listbox.insert(
+                        tk.END,
+                        f"{product['Todas', 'Sabor']} ({product['Todas', 'Categoria']}) - R${preco:.2f}"
+                    )
+
 
         def on_select():
             selected_index = product_listbox.curselection()
@@ -772,19 +806,23 @@ class POSApplication:
 
         manual_add_window = tk.Toplevel(self.root)
         manual_add_window.title("Adicionar produto manualmente")
-        manual_add_window.configure(bg="#1a1a2e")
+        manual_add_window.configure(bg="#8b0000")
+        manual_add_window.attributes("-topmost", True)
 
-        search_frame = tk.Frame(manual_add_window, bg="#1a1a2e")
+        search_frame = tk.Frame(manual_add_window, bg="#8b0000")
         search_frame.pack(padx=10, pady=10)
 
         search_label = ttk.Label(
             search_frame, text="Pesquisar por categoria, sabor, ou preco:",
-            background="#1a1a2e", foreground="#ffffff"
+            background="#8b0000", foreground="#ffffff"
         )
         search_label.pack(side=tk.LEFT)
 
         search_entry = ttk.Entry(search_frame)
         search_entry.pack(side=tk.LEFT, padx=(5, 0))
+        search_entry.bind("<Return>", lambda event: (search_products(), "break")[1])
+        search_entry.bind("<KeyRelease>", lambda event: (search_products(), "break")[1])
+
 
         search_button = ttk.Button(search_frame, text="Pesquisar", command=search_products)
         search_button.pack(side=tk.LEFT, padx=(5, 0))
@@ -835,7 +873,7 @@ class POSApplication:
             delete_button = tk.Button(
                 self.sale_frame, text="✖",
                 command=lambda b=excel_row: self.delete_product(b),
-                bg="#1a1a2e", fg="red", font=("Arial", int(16 * self.scale_factor)),
+                bg="#1a1a2e", fg="#ffffff", font=("Arial", int(16 * self.scale_factor)),
                 borderwidth=0
             )
             delete_button.grid(row=row, column=3, padx=5, pady=2)
@@ -844,7 +882,7 @@ class POSApplication:
             edit_button = tk.Button(
                 self.sale_frame, text="✎",
                 command=lambda b=excel_row: self.edit_product(b),
-                bg="#1a1a2e", fg="#00ff00", font=("Arial", int(16 * self.scale_factor)),
+                bg="#1a1a2e", fg="#ffffff", font=("Arial", int(16 * self.scale_factor)),
                 borderwidth=0
             )
             edit_button.grid(row=row, column=4, padx=5, pady=2)
@@ -864,7 +902,6 @@ class POSApplication:
             widgets['text_widget'].config(state=tk.NORMAL)
             widgets['text_widget'].delete("1.0", tk.END)
             widgets['text_widget'].insert(tk.END, f"{details['categoria']} - {details['sabor']}")
-            print(details['categoria'] + " - " + details['sabor'])
             widgets['text_widget'].config(state=tk.DISABLED)
 
             # Atualiza a quantidade
