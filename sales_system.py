@@ -6,12 +6,22 @@ from datetime import datetime
 from openpyxl import load_workbook, Workbook
 import ctypes
 import platform
+import requests
+import uuid
+import qrcode
+from PIL import Image, ImageTk  # Ensure both Image and ImageTk are imported
+import threading
+import time
+import numpy as np
+import math
+
+import config
 
 
 # Constants for UI scaling
 BASE_WIDTH = 1920
 BASE_HEIGHT = 1080
-Version = "0.1.3"
+Version = "0.3.1"
 
 def is_numlock_on():
     if platform.system() != 'Windows':
@@ -19,6 +29,7 @@ def is_numlock_on():
     hllDll = ctypes.WinDLL ("User32.dll")
     VK_NUMLOCK = 0x90
     return hllDll.GetKeyState(VK_NUMLOCK) & 1
+
 
 def set_numlock(state=True):
 
@@ -32,7 +43,6 @@ def set_numlock(state=True):
 
     current_state = is_numlock_on()
     if current_state != state:
-        print("pressing NumLock")
         # Simulate key press
         hllDll.keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | 0, 0)
         hllDll.keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
@@ -145,10 +155,16 @@ class ProductDatabase:
     def filter_products(self, search_term, shop):
         if self.df.empty:
             return pd.DataFrame()
+
+        df_copy = self.df.copy()
+        df_copy[(shop, 'Preco')] = pd.to_numeric(df_copy[(shop, 'Preco')], errors='coerce')
+        df_copy[(shop, 'Preco')] = df_copy[(shop, 'Preco')].apply(
+            lambda x: f"{x:.2f}".replace('.', ',') if pd.notnull(x) else "" )
+
         mask = (
                 self.df['Todas', 'Categoria'].str.contains(search_term, case=False, na=False) |
                 self.df['Todas', 'Sabor'].str.contains(search_term, case=False, na=False) |
-                self.df[shop, 'Preco'].astype(str).str.contains(search_term, case=False, na=False)
+                df_copy[(shop, 'Preco')].astype(str).str.contains(search_term, case=False, na=False)
         )
         return self.df[mask]
 
@@ -179,12 +195,13 @@ class ProductDatabase:
         return self.df[self.df['Todas', 'Codigo de Barras'].str.strip() == barcode.strip()]
 
 class Sale:
-    def __init__(self, product_db, shop, payment_method="Débito"):
+    def __init__(self, product_db, shop, payment_method=""):
         self.product_db = product_db
         self.shop = shop
         self.payment_method = payment_method
         self.current_sale = {}
         self.final_price = 0.0
+        self.id = str(uuid.uuid4())
 
     def apply_promotion(self):
         total_price = 0.0
@@ -204,7 +221,9 @@ class Sale:
             price = product['preco']
             promo_price = product['promo_preco']
 
-            if self.payment_method in ['Pix', 'Dinheiro'] and category_quantities[category] >= promo_qty:
+            if (self.payment_method in ['Pix', 'Dinheiro'] and
+                    promo_qty is not None and
+                    category_quantities[category] >= promo_qty):
                 total_price += promo_price * quantity
             else:
                 total_price += price * quantity
@@ -214,12 +233,12 @@ class Sale:
 
     def add_product(self, product):
         excel_row = product[('Metadata', 'Excel Row')]
-        if excel_row not in self.current_sale:
+        if excel_row not in self.current_sale or (type(excel_row) == str and excel_row.startswith('Manual')):
             self.current_sale[excel_row] = {
                 'categoria': product[('Todas', 'Categoria')],
                 'sabor': product[('Todas', 'Sabor')],
-                'preco': product[(self.shop, 'Preco')],  # Já é float
-                'promo_preco': product.get((self.shop, 'Promo Preco'), product[(self.shop, 'Preco')]),  # float
+                'preco': product[(self.shop, 'Preco')],
+                'promo_preco': product.get((self.shop, 'Promo Preco'), product[(self.shop, 'Preco')]),
                 'promo_qt': product.get((self.shop, 'Promo Quantidade'), 1),  # int
                 'quantidade': 1,
                 'indexExcel': excel_row
@@ -236,7 +255,6 @@ class Sale:
             self.current_sale[excel_row]['quantidade'] = max(quantity, 0)
             if self.current_sale[excel_row]['quantidade'] == 0:
                 self.remove_product(excel_row)
-
 
 class POSApplication:
     def __init__(self, root):
@@ -259,16 +277,20 @@ class POSApplication:
         self.selected_shop_var = tk.StringVar()
 
         # Initialize payment method variable here
-        self.payment_method_var = tk.StringVar(value="Débito")  # Initialized here
+        self.payment_method_var = tk.StringVar(value="")  # Initialized here
 
         # Initialize sale
         self.sale = None
+        self.stored_sales = []
 
         # Dictionary to keep track of widgets for each product
         self.product_widgets = {}
 
         # Initialize UI components
         self.initialize_ui()
+
+        self.manual_add_count = 0
+        self.manual_add_list = []
 
     def initialize_ui(self):
         self.select_shop_window()
@@ -286,7 +308,7 @@ class POSApplication:
 
         shop_window = tk.Toplevel(self.root)
         shop_window.title("Selecione a loja")
-        shop_window.configure(bg="#1a1a2e")
+        shop_window.configure(bg="#8b0000")
         shop_window.attributes("-topmost", True)
 
         # Scale geometry
@@ -308,10 +330,10 @@ class POSApplication:
         combobox_font = ("Arial", int(14 * self.scale_factor))
 
         # Label
-        tk.Label(shop_window, text="Selecione a loja", bg="#1a1a2e", fg="#ffffff",
+        tk.Label(shop_window, text="Selecione a loja", bg="#8b0000", fg="#ffffff",
                  font=title_font).pack(pady=int(10 * self.scale_factor))
 
-        tk.Label(shop_window, text=f"Versao: {Version}", bg="#1a1a2e", fg="#ffffff",
+        tk.Label(shop_window, text=f"Versao: {Version}", bg="#8b0000", fg="#ffffff",
                  font=version_font).pack(pady=0)
 
 
@@ -343,7 +365,7 @@ class POSApplication:
         self.root.configure(bg="#1a1a2e")
 
         # Fonts
-        title_font = ("Arial", int(50 * self.scale_factor), "bold")
+        title_font = ("Arial", int(35 * self.scale_factor), "bold")
         shop_font = ("Arial", int(32 * self.scale_factor))
         entry_font = ("Arial", int(16 * self.scale_factor))
         product_list_font = ("Arial", int(16 * self.scale_factor))
@@ -354,12 +376,15 @@ class POSApplication:
         # Title Label
         title_label = ttk.Label(self.root, text="Sorveteria Lolla", font=title_font, background="#1a1a2e",
                                 foreground="#ffffff")
-        title_label.grid(row=0, column=0, columnspan=3, pady=int(20 * self.scale_factor), sticky="n")
+        title_label.grid(row=0, column=0, columnspan=3, pady=int(20 * self.scale_factor),
+                         padx = int(20 * self.scale_factor), sticky="nw")
 
         # Configure grid
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_columnconfigure(1, weight=0)
         self.root.grid_columnconfigure(2, weight=1)
+        self.root.grid_rowconfigure(2, weight=0)
+        self.root.grid_rowconfigure(3, weight=1)
 
         # Frame para Botões de Controle (Minimizar e Fechar)
         control_frame = tk.Frame(self.root, bg="#1a1a2e")
@@ -385,33 +410,31 @@ class POSApplication:
             foreground="#ffffff", font=shop_font
         )
         selected_shop_label.grid(
-            row=1, column=0, columnspan=3, padx=int(10 * self.scale_factor),
-            pady=0, sticky="n"
+            row=0, column=0, columnspan=3, padx=int(20 * self.scale_factor),
+            pady=int(70 * self.scale_factor), sticky="sw"
         )
 
         # Barcode Entry
-        self.barcode_entry = ttk.Entry(self.root, font=entry_font, width=30)
+        self.barcode_entry = ttk.Combobox(self.root, state="normal", font=entry_font, width=45)
         self.barcode_entry.grid(
-            row=2, column=0, columnspan=3, padx=int(10 * self.scale_factor),
-            pady=int(5 * self.scale_factor)
+            row=0, column=0, columnspan=3, padx=int(0 * self.scale_factor),
+            pady=int(5 * self.scale_factor), sticky=""
         )
         self.barcode_entry.bind('<Return>', self.handle_barcode)
-
-        # Add Product Button
-        add_product_button = ttk.Button(
-            self.root, text="Pesquisar produto", command=self.open_manual_add_window,
-            style="Rounded.TButton", width=20
-        )
-        add_product_button.grid(
-            row=3, column=0, columnspan=3, padx=int(10 * self.scale_factor),
-            pady=int(5 * self.scale_factor)
-        )
+        self.barcode_entry.bind('<KeyRelease>', self.search_products)
 
         # Sale Frame
         self.sale_frame = tk.Frame(self.root, bg="#1a1a2e")
         self.sale_frame.grid(
-            row=4, column=0, padx=int(10 * self.scale_factor),
+            row=2, column=0, padx=int(10 * self.scale_factor),
             pady=int(10 * self.scale_factor), sticky="nw"
+        )
+
+        #Stored Sale Frame
+        self.stored_sale_frame = tk.Frame(self.root, bg="#1a1a2e")
+        self.stored_sale_frame.grid(
+            row=2, column=0, padx=int(30 * self.scale_factor),
+            pady=int(700 * self.scale_factor), sticky="nw"
         )
 
         # Final Price Label
@@ -420,9 +443,52 @@ class POSApplication:
             foreground="#ffffff"
         )
         self.final_price_label.grid(
-            row=2, column=2, columnspan=3, pady=int(20 * self.scale_factor),
+            row=1, column=2, columnspan=3, pady=int(25 * self.scale_factor),
             padx=int(50 * self.scale_factor), sticky="ne"
         )
+
+        #Status
+        self.status_label = ttk.Label(
+            self.root, text="", background="#1a1a2e",
+            foreground="#ff8888", font=label_font
+        )
+        self.status_label.grid(
+            row=1, column=2, columnspan=3, padx=int(50 * self.scale_factor),
+            pady=int(5 * self.scale_factor), sticky="se"
+        )
+
+
+
+        valor_pago_label = ttk.Label(
+            self.root, text="Valor Pago:", background="#1a1a2e",
+            foreground="#ffffff", font=label_font
+        )
+        valor_pago_label.grid(
+            row=2, column=2, padx=int(200 * self.scale_factor),
+            pady=int(5 * self.scale_factor), sticky="ne"
+        )
+
+
+        self.valor_pago_entry = ttk.Entry(
+            self.root, font=entry_font, width=10
+        )
+        self.valor_pago_entry.grid(
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(5 * self.scale_factor), sticky="ne"
+        )
+        self.valor_pago_entry.bind("<KeyRelease>", self.calcular_troco)
+
+
+        self.troco_label = ttk.Label(
+            self.root, text="", background="#1a1a2e",
+            foreground="#ffffff", font=label_font
+        )
+        self.troco_label.grid(
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(40 * self.scale_factor), sticky="ne"
+        )
+
+
 
         # Payment Method
         payment_method_label = ttk.Label(
@@ -430,118 +496,216 @@ class POSApplication:
             foreground="#ffffff", font=label_font
         )
         payment_method_label.grid(
-            row=3, column=2, padx=int(80 * self.scale_factor),
-            pady=int(5 * self.scale_factor), sticky="ne"
+            row=2, column=2, padx=int(80 * self.scale_factor),
+            pady=int(100 * self.scale_factor), sticky="ne"
         )
 
         payment_method_combobox = ttk.Combobox(
             self.root, textvariable=self.payment_method_var,
-            values=["Débito", "Pix", "Dinheiro", "Crédito"],
+            values=["", "Débito", "Pix", "Dinheiro", "Crédito"],
             state="readonly", font=entry_font, width=20
         )
         payment_method_combobox.grid(
-            row=3, column=2, padx=int(60 * self.scale_factor),
-            pady=int(35 * self.scale_factor), sticky="ne"
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(130 * self.scale_factor), sticky="ne"
         )
         payment_method_combobox.current(0)
         payment_method_combobox.bind("<<ComboboxSelected>>", self.update_payment_method)
 
-        # Style for Rounded Buttons
-        style = ttk.Style()
-        style.configure(
-            "Rounded.TButton", font=button_font, padding=int(15 * self.scale_factor),
-            relief="flat", background="#ffffff"
+
+        pay_button = tk.Button(
+            self.root, text="Cobrar", font=button_font,
+            command=self.cobrar, width=23, height=2
         )
-        style.map(
-            "Rounded.TButton",
-            background=[("active", "#ffffff")],
-            relief=[("pressed", "sunken")]
+        pay_button.grid(
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(170 * self.scale_factor), sticky="ne"
         )
 
-        # Finalize and Clear Buttons
-        button_frame = tk.Frame(self.root, bg="#1a1a2e")
-        button_frame.grid(
-            row=4, column=2, pady=int(10 * self.scale_factor),
-            padx=int(50 * self.scale_factor), sticky="ne"
+        #Finalize Sale Button
+        finalize_sale_button = tk.Button(
+            self.root, text="Finalizar compra", font=button_font,
+            command=lambda: self.finalize_sale(self.sale.id), width=23, height=2
         )
 
-        finalize_sale_button = ttk.Button(
-            button_frame, text="Finalizar compra", style="Rounded.TButton",
-            command=self.finalize_sale, width=20
-        )
         finalize_sale_button.grid(
-            row=1, column=0, padx=int(10 * self.scale_factor),
-            pady=int(5 * self.scale_factor)
-        )
-
-        # Troco Frame
-        troco_frame = tk.Frame(button_frame, bg="#1a1a2e")
-        troco_frame.grid(row=2, column=0, pady=int(20 * self.scale_factor), sticky="ne")
-
-        valor_pago_label = ttk.Label(
-            troco_frame, text="Valor Pago:", background="#1a1a2e",
-            foreground="#ffffff", font=label_font
-        )
-        valor_pago_label.grid(
-            row=0, column=0, padx=int(5 * self.scale_factor),
-            pady=int(5 * self.scale_factor), sticky="e"
-        )
-
-        self.valor_pago_entry = ttk.Entry(
-            troco_frame, font=entry_font, width=10
-        )
-        self.valor_pago_entry.grid(
-            row=0, column=1, padx=int(5 * self.scale_factor),
-            pady=int(5 * self.scale_factor), sticky="w"
-        )
-        self.valor_pago_entry.bind("<KeyRelease>", self.calcular_troco)
-
-        self.troco_label = ttk.Label(
-            troco_frame, text="", background="#1a1a2e",
-            foreground="#ffffff", font=label_font
-        )
-        self.troco_label.grid(
-            row=1, column=0, columnspan=2, padx=int(5 * self.scale_factor),
-            pady=int(5 * self.scale_factor)
-        )
-
-        self.sugestao_troco_label = ttk.Label(
-            troco_frame, text="", background="#1a1a2e",
-            foreground="#ffffff", font=label_font, justify="left"
-        )
-        self.sugestao_troco_label.grid(
-            row=2, column=0, columnspan=2, padx=int(5 * self.scale_factor),
-            pady=int(5 * self.scale_factor), sticky="w"
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(300 * self.scale_factor), sticky="ne"
         )
 
         # Clear Sale Button
-        clear_sale_button = ttk.Button(
-            self.root, text="Limpar", style="Rounded.TButton",
-            command=self.new_sale, width=20
+        clear_sale_button = tk.Button(
+            self.root, text="Nova venda", font=button_font,
+            command=self.new_sale, width=23, height=1
         )
         clear_sale_button.grid(
-            row=5, column=2, padx=int(10 * self.scale_factor),
-            pady=int(5 * self.scale_factor), sticky="se"
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(375 * self.scale_factor), sticky="ne"
         )
 
         # Add New Product Button
-        add_new_product_button = ttk.Button(
-            self.root, text="Adicionar novo produto", command=self.open_add_product_window,
-            style="Rounded.TButton", width=20
+        add_new_product_button = tk.Button(
+            self.root, text="Cadastrar novo produto", command=self.edit_product,
+            font=button_font, width=23, height=1
         )
         add_new_product_button.grid(
-            row=4, column=2, padx=int(10 * self.scale_factor),
-            pady=int(5 * self.scale_factor), sticky="se"
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(430 * self.scale_factor), sticky="ne"
+        )
+
+        # History button
+        history_button = tk.Button(
+            self.root, text="Historico", command=self.open_sales_history,
+            font=button_font, width=23, height=1
+        )
+        history_button.grid(
+            row=2, column=2, padx=int(50 * self.scale_factor),
+            pady=int(485 * self.scale_factor), sticky="ne"
         )
 
         self.update_sale_display()
         self.root.grid_rowconfigure(4, weight=1)
 
+    def open_sales_history(self):
+        SalesHistoryWindow(self.root)
+
+    def search_products(self, event=None, force_search=False):
+        search_term = self.barcode_entry.get()
+
+        if not search_term.isdigit() or force_search:
+            if search_term:
+                search_term = search_term.lower()
+                shop = self.selected_shop_var.get()
+
+                if ',' in search_term:
+                    search_term = search_term.replace(',', '.')
+
+                # Filter products by barcode, category, flavor, or price
+                self.filtered_products = self.product_db.df[
+                    self.product_db.df[('Todas', 'Codigo de Barras')].str.contains(search_term, case=False, na=False) |
+                    self.product_db.df[('Todas', 'Categoria')].str.contains(search_term, case=False, na=False) |
+                    self.product_db.df[('Todas', 'Sabor')].str.contains(search_term, case=False, na=False) |
+                    self.product_db.df[(shop, 'Preco')].astype(str).str.contains(search_term, case=False, na=False)
+                    ]
+
+                # Populate the combobox with filtered products
+                self.barcode_entry['values'] = [
+                    f"{product['Todas', 'Codigo de Barras']} - {product['Todas', 'Sabor']} ({product['Todas', 'Categoria']}) - R${product[(shop, 'Preco')]:.2f}".replace(
+                        '.', ',')
+                    for _, product in self.filtered_products.iterrows()
+                ]
+
+                if self.barcode_entry['values']:
+                    self.barcode_entry.event_generate(
+                        "<<ComboboxSelected>>")  # Trigger selection event if results are found
+
+                # Bind selection event to callback
+                self.barcode_entry.bind("<<ComboboxSelected>>", self.handle_product_selection)
+
+    def handle_product_selection(self, event):
+        # Get selected product details
+        selected_index = self.barcode_entry.current()
+        if selected_index != -1:  # Ensure a valid selection
+            selected_product = self.filtered_products.iloc[selected_index]
+            self.sale.add_product(selected_product)
+            self.update_sale_display()
+            self.barcode_entry.delete(0, 'end')
+            self.barcode_entry['values'] = []
+
+    def confirm_read_error(self, barcode):
+        def compare(event=None):
+            entered_barcode = barcode_input.get()
+            if entered_barcode != "":
+                if entered_barcode == barcode:
+                    self.edit_product(barcode=entered_barcode)
+                else:
+                    self.barcode_entry.set(entered_barcode)
+                    self.handle_barcode()
+                barcode_error_window.destroy()
+
+        barcode_error_window = tk.Toplevel(self.root)
+        barcode_error_window.title("Possível erro de leitura")
+        barcode_error_window.configure(bg="#8b0000")
+        barcode_error_window.attributes("-topmost", True)
+
+        # Scale geometry
+        win_width = int(400 * self.scale_factor)
+        win_height = int(200 * self.scale_factor)
+        barcode_error_window.geometry(f"{win_width}x{win_height}")
+        barcode_error_window.resizable(False, False)
+        barcode_error_window.grab_set()  # Make modal
+
+        # Center the window
+        barcode_error_window.update_idletasks()
+        x = (barcode_error_window.winfo_screenwidth() // 2) - (win_width // 2)
+        y = (barcode_error_window.winfo_screenheight() // 2) - (win_height // 2)
+        barcode_error_window.geometry(f"+{x}+{y}")
+
+        # Fonts
+        title_font = ("Arial", int(20 * self.scale_factor), "bold")
+        input_font = ("Arial", int(14 * self.scale_factor))
+
+        # Label
+        tk.Label(
+            barcode_error_window,
+            text="Escaneie novamente",
+            bg="#8b0000",
+            fg="#ffffff",
+            font=title_font
+        ).pack(pady=int(10 * self.scale_factor))
+
+        # Input
+        barcode_input = ttk.Entry(
+            barcode_error_window,
+            font=input_font,
+            width=20
+        )
+        barcode_input.pack(
+            padx=int(20 * self.scale_factor),
+            pady=int(10 * self.scale_factor)
+        )
+        barcode_input.bind("<Return>", compare)
+        barcode_input.focus_set()  # Focus on the input field
+
+        # Wait for the window to close
+        #self.root.wait_window(barcode_error_window)
+
     def handle_barcode(self, event=None):
+
+        input_barcode = self.barcode_entry.get().strip()
         barcode = self.barcode_entry.get().strip()
         if not barcode:
             return
         current_shop = self.selected_shop_var.get()
+
+        # Se for digitado um valor
+        if ',' in input_barcode or '.' in input_barcode:
+            try:
+                value = float(input_barcode.replace(",", "."))
+                self.manual_add_count = self.manual_add_count + 1
+                product = {
+                    ('Metadata', 'Excel Row'): 'Manual_'+str(self.manual_add_count),
+                    ('Todas', 'Categoria'): 'Não cadastrado',
+                    ('Todas', 'Sabor'): '',
+                    (current_shop, 'Preco'): value,
+                    (current_shop, 'Promo Preco'): None,
+                    (current_shop, 'Promo Quantidade'): None
+                }
+
+
+                self.manual_add_list.append(product)
+                self.sale.add_product(product)
+                self.update_sale_display()
+                self.barcode_entry.delete(0, 'end')
+                return
+            except Exception:
+                pass
+
+
+        # Se foi digitado uma pesquisa
+        if not input_barcode.isdigit():
+            self.barcode_entry.event_generate('<Down>')
+            return
 
         # Obtém todos os produtos com o mesmo código de barras na loja atual
         matching_products = self.product_db.get_products_by_barcode_and_shop(barcode, current_shop)
@@ -551,7 +715,8 @@ class POSApplication:
             other_products = self.product_db.get_products_by_barcode(barcode)
             if other_products.empty:
                 # Nenhum produto encontrado, abrir janela para adicionar novo produto
-                self.open_add_product_window(barcode=barcode)
+                self.confirm_read_error(barcode=barcode)
+                #self.edit_product(barcode=barcode)
             else:
                 # Produtos encontrados em outras lojas, abrir janela para adicionar
                 # Encontrar a primeira loja que possui o produto
@@ -564,279 +729,33 @@ class POSApplication:
 
                 if prefill_store:
                     existing_product = other_products.iloc[0]
-                    self.open_add_product_window(barcode=barcode, prefill_product=existing_product,
-                                                 prefill_store=prefill_store)
+                    self.edit_product(index_excel=other_products.iloc[0][('Metadata', 'Excel Row')],
+                                      prefill_store=prefill_store)
                 else:
                     # Se nenhuma loja possui o Preco definido, abrir sem pré-preenchimento
-                    self.open_add_product_window(barcode=barcode)
+                    self.edit_product(barcode=barcode)
         else:
             if len(matching_products) == 1:
                 # Apenas um produto encontrado na loja atual, adiciona diretamente
                 product = matching_products.iloc[0]
                 self.sale.add_product(product)
-                self.update_sale_display(product=product)  # Passa o produto completo
+                self.update_sale_display()
             else:
                 # Múltiplos produtos encontrados na loja atual, abrir seleção
-                self.select_product_window(matching_products)
+                self.search_products(force_search=True)
+                self.barcode_entry.event_generate('<Down>')
+                return
 
         self.barcode_entry.delete(0, 'end')
 
-    def select_product_window(self, matching_products):
-        def on_select():
-            selected_index = listbox.curselection()
-            if selected_index:
-                selected_product = matching_products.iloc[selected_index[0]]
-                self.sale.add_product(selected_product)
-                selection_window.destroy()
-                self.update_sale_display(product=selected_product)  # Passa o produto completo
-
-        selection_window = tk.Toplevel(self.root)
-        selection_window.title("Selecione o Produto")
-        selection_window.configure(bg="#8b0000")
-        selection_window.attributes("-topmost", True)
-
-        # Dimensionamento e posicionamento
-        win_width = int(600 * self.scale_factor)
-        win_height = int(400 * self.scale_factor)
-        selection_window.geometry(f"{win_width}x{win_height}")
-        selection_window.resizable(False, False)
-        selection_window.grab_set()  # Torna a janela modal
-
-        # Centralizar a janela
-        selection_window.update_idletasks()
-        x = (selection_window.winfo_screenwidth() // 2) - (win_width // 2)
-        y = (selection_window.winfo_screenheight() // 2) - (win_height // 2)
-        selection_window.geometry(f"+{x}+{y}")
-
-        # Título
-        title_font = ("Arial", int(20 * self.scale_factor), "bold")
-        tk.Label(selection_window, text="Selecione o Produto", bg="#8b0000", fg="#ffffff", font=title_font).pack(
-            pady=int(20 * self.scale_factor))
-
-        # Listbox com scrollbar
-        list_frame = tk.Frame(selection_window, bg="#8b0000")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, font=("Arial", int(14 * self.scale_factor)))
-        listbox.pack(fill=tk.BOTH, expand=True)
-        listbox.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=listbox.yview)
-
-        # Preencher a listbox com os produtos
-        for idx, product in matching_products.iterrows():
-            preco = product[(self.selected_shop_var.get(), 'Preco')]
-            listbox.insert(tk.END,
-                           f"{product[('Todas', 'Categoria')]}  {product[('Todas', 'Sabor')]}  R${preco:.2f}")
-
-        # Botão de Seleção
-        select_button = ttk.Button(selection_window, text="Selecionar", command=on_select)
-        select_button.pack(pady=int(10 * self.scale_factor))
-
-    def open_add_product_window(self, barcode=None, prefill_product=None, prefill_store=None):
-        def parse_float(value):
-            """Converte um valor para float, aceitando ',' ou '.' como separador decimal."""
-            if value:
-                try:
-                    return float(value.replace(',', '.'))
-                except ValueError:
-                    raise ValueError(f"Valor inválido para número decimal: {value}")
-            return None
-
-        def parse_int(value):
-            if value:
-                try:
-                    # Tenta converter para float primeiro
-                    float_val = float(value.strip())
-                    if float_val.is_integer():
-                        return int(float_val)
-                    else:
-                        raise ValueError(f"Valor inválido para número inteiro: {value}")
-                except ValueError:
-                    raise ValueError(f"Valor inválido para número inteiro: {value}")
-            return None
-
-        def save_product():
-            try:
-                # Obter e limpar os valores dos campos
-                barcode_val = barcode_entry.get().strip()
-                sabor = flavor_combobox.get().strip()
-                categoria = category_combobox.get().strip()
-                preco = price_entry.get().strip()
-                promo_preco = promo_price_entry.get().strip()
-                promo_qt = promo_qty_entry.get().strip()
-
-                shop = self.selected_shop_var.get().strip()
-
-                # Validação dos campos obrigatórios
-                if not all([barcode_val, sabor, categoria, preco, shop]):
-                    messagebox.showerror("Erro", "Preencha todos os campos necessários")
-                    return
-
-                # Conversão para valores numéricos, permitindo ',' ou '.'
-                preco_val = parse_float(preco)
-                promo_preco_val = parse_float(promo_preco) if promo_preco else None
-                promo_qt_val = parse_int(promo_qt) if promo_qt else None
-
-                # Construir o dicionário 'product_info'
-                product_info = {
-                    'indexExcel': index_value,
-                    'barcode': barcode_val,
-                    'sabor': sabor,
-                    'categoria': categoria,
-                    'preco': preco_val,
-                    'promo_preco': promo_preco_val,
-                    'promo_qt': promo_qt_val,
-                }
-
-                # Adicionar ou atualizar o produto na base de dados
-                self.product_db.add_product(product_info, shop)
-                self.update_sale_display()  # Atualizar a exibição da venda
-                add_product_window.destroy()
-            except Exception as e:
-                messagebox.showerror("Erro", f"Falha ao adicionar/atualizar o produto: {e}")
-
-        # Criar a janela de adicionar produto
-        add_product_window = tk.Toplevel(self.root)
-        add_product_window.title("Adicionar/Atualizar Produto")
-        add_product_window.configure(bg="#8b0000")
-        add_product_window.attributes("-topmost", True)
-
-        # Frame para inputs
-        input_frame = tk.Frame(add_product_window, bg="#8b0000")
-        input_frame.pack(pady=10, padx=10)
-
-        # Código de Barras
-        tk.Label(input_frame, text="Código de Barras", bg="#8b0000", fg="#ffffff").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        barcode_entry = ttk.Entry(input_frame)
-        barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        if barcode:
-            barcode_entry.insert(0, barcode)
-
-        # Preencher campos com valores existentes, se houver
-        if prefill_product is not None:
-            index_value = prefill_product[('Metadata', 'Excel Row')]
-            sabor_value = prefill_product[('Todas', 'Sabor')]
-            categoria_value = prefill_product[('Todas', 'Categoria')]
-            if prefill_store:
-                preco_value = prefill_product.get((prefill_store, 'Preco'), "")
-                promo_preco_value = prefill_product.get((prefill_store, 'Promo Preco'), "")
-                promo_qt_value = prefill_product.get((prefill_store, 'Promo Quantidade'), "")
-            else:
-                preco_value = ""
-                promo_preco_value = ""
-                promo_qt_value = ""
-        else:
-            index_value = None
-            sabor_value = ""
-            categoria_value = ""
-            preco_value = ""
-            promo_preco_value = ""
-            promo_qt_value = ""
-
-        # Sabor
-        tk.Label(input_frame, text="Sabor:", bg="#8b0000", fg="#ffffff").grid(row=0, column=2, padx=5, pady=5, sticky="e")
-        flavor_combobox = ttk.Combobox(
-            input_frame,
-            values=self.product_db.get_unique_values('Sabor'),
-            state="normal"
-        )
-        flavor_combobox.grid(row=0, column=3, padx=5, pady=5, sticky="w")
-        flavor_combobox.insert(0, sabor_value)  # Preencher sabor se disponível
-
-        # Categoria
-        tk.Label(input_frame, text="Categoria:", bg="#8b0000", fg="#ffffff").grid(row=0, column=4, padx=5, pady=5, sticky="e")
-        category_combobox = ttk.Combobox(
-            input_frame,
-            values=self.product_db.get_unique_values('Categoria'),
-            state="normal"
-        )
-        category_combobox.grid(row=0, column=5, padx=5, pady=5, sticky="w")
-        category_combobox.insert(0, categoria_value)  # Preencher categoria se disponível
-
-        # Preço
-        tk.Label(input_frame, text="Preço:", bg="#8b0000", fg="#ffffff").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        price_entry = ttk.Entry(input_frame)
-        price_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
-        if preco_value and preco_value != "":
-            price_entry.insert(0, preco_value)
-
-        # Promo Preço
-        tk.Label(input_frame, text="Promo Preço:", bg="#8b0000", fg="#ffffff").grid(row=1, column=2, padx=5, pady=5, sticky="e")
-        promo_price_entry = ttk.Entry(input_frame)
-        promo_price_entry.grid(row=1, column=3, padx=5, pady=5, sticky="w")
-        if promo_preco_value and promo_preco_value != "":
-            promo_price_entry.insert(0, promo_preco_value)
-
-        # Promo Quantidade
-        tk.Label(input_frame, text="Promo Quantidade:", bg="#8b0000", fg="#ffffff").grid(row=1, column=4, padx=5, pady=5, sticky="e")
-        promo_qty_entry = ttk.Entry(input_frame)
-        promo_qty_entry.grid(row=1, column=5, padx=5, pady=5, sticky="w")
-        if promo_qt_value and promo_qt_value != "":
-            promo_qty_entry.insert(0, promo_qt_value)
-
-        # Botão para salvar
-        save_button = ttk.Button(add_product_window, text="Salvar/Atualizar Produto", command=save_product)
-        save_button.pack(pady=20)
-
-    def open_manual_add_window(self):
-        def search_products():
-            product_listbox.delete(0, tk.END)
-            if search_entry.get() != "":
-                search_term = search_entry.get().lower()
-                self.filtered_products = self.product_db.filter_products(search_term, self.selected_shop_var.get())
-
-                for _, product in self.filtered_products.iterrows():
-                    preco = product[(self.selected_shop_var.get(), 'Preco')]
-                    product_listbox.insert(
-                        tk.END,
-                        f"{product['Todas', 'Sabor']} ({product['Todas', 'Categoria']}) - R${preco:.2f}"
-                    )
-
-
-        def on_select():
-            selected_index = product_listbox.curselection()
-            if selected_index:
-                selected_product = self.filtered_products.iloc[selected_index[0]]
-                self.sale.add_product(selected_product)
-                manual_add_window.destroy()
-                self.update_sale_display()
-
-        manual_add_window = tk.Toplevel(self.root)
-        manual_add_window.title("Adicionar produto manualmente")
-        manual_add_window.configure(bg="#8b0000")
-        manual_add_window.attributes("-topmost", True)
-
-        search_frame = tk.Frame(manual_add_window, bg="#8b0000")
-        search_frame.pack(padx=10, pady=10)
-
-        search_label = ttk.Label(
-            search_frame, text="Pesquisar por categoria, sabor, ou preco:",
-            background="#8b0000", foreground="#ffffff"
-        )
-        search_label.pack(side=tk.LEFT)
-
-        search_entry = ttk.Entry(search_frame)
-        search_entry.pack(side=tk.LEFT, padx=(5, 0))
-        search_entry.bind("<Return>", lambda event: (search_products(), "break")[1])
-        search_entry.bind("<KeyRelease>", lambda event: (search_products(), "break")[1])
-
-
-        search_button = ttk.Button(search_frame, text="Pesquisar", command=search_products)
-        search_button.pack(side=tk.LEFT, padx=(5, 0))
-
-        product_listbox = tk.Listbox(manual_add_window, height=10, bg="#ffffff", font=("Arial", 12))
-        product_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        select_button = ttk.Button(manual_add_window, text="Selecionar", command=on_select)
-        select_button.pack(pady=5)
-
-    def update_payment_method(self, event=None):
+    def update_payment_method(self, event=None, method=None):
+        if method is not None:
+            self.payment_method_var.set(method)
         self.sale.payment_method = self.payment_method_var.get()
         self.sale.apply_promotion()
         self.update_sale_display()
+        if self.payment_method_var.get() == "Dinheiro":
+            self.valor_pago_entry.focus()
 
     def create_or_update_product_widget(self, excel_row, details):
 
@@ -849,7 +768,10 @@ class POSApplication:
                 font=("Arial", 18), bd=0, highlightthickness=0
             )
             text_widget.grid(row=row, column=0, padx=50, pady=2, sticky="w")
-            text_widget.insert(tk.END, f"{details['categoria']} - {details['sabor']}")
+            if details['sabor'] == '':
+                text_widget.insert(tk.END, f"{details['categoria']}")
+            else:
+                text_widget.insert(tk.END, f"{details['categoria']} - {details['sabor']}")
             text_widget.tag_configure("bold", font=("Arial", 18, "bold"))
             text_widget.config(state=tk.DISABLED)
 
@@ -878,30 +800,45 @@ class POSApplication:
             )
             delete_button.grid(row=row, column=3, padx=5, pady=2)
 
-            # Botão de editar
-            edit_button = tk.Button(
-                self.sale_frame, text="✎",
-                command=lambda b=excel_row: self.edit_product(b),
-                bg="#1a1a2e", fg="#ffffff", font=("Arial", int(16 * self.scale_factor)),
-                borderwidth=0
-            )
-            edit_button.grid(row=row, column=4, padx=5, pady=2)
+            self.product_widgets[excel_row] = None
+            if type(excel_row) == str and excel_row.startswith('Manual'):
+                self.product_widgets[excel_row] = {
+                    'text_widget': text_widget,
+                    'price_label': price_label,
+                    'quantity_entry': quantity_entry,
+                    'quantity_var': quantity_var,
+                    'delete_button': delete_button
+                }
+            else:
+                edit_button = tk.Button(
+                    self.sale_frame, text="✎",
+                    command=lambda b=excel_row: self.edit_product(b),
+                    bg="#1a1a2e", fg="#ffffff", font=("Arial", int(16 * self.scale_factor)),
+                    borderwidth=0
+                )
+                edit_button.grid(row=row, column=4, padx=5, pady=2)
 
-            # Armazena os widgets no dicionário
-            self.product_widgets[excel_row] = {
-                'text_widget': text_widget,
-                'price_label': price_label,
-                'quantity_entry': quantity_entry,
-                'quantity_var': quantity_var,
-                'delete_button': delete_button,
-                'edit_button': edit_button
-            }
+                # Armazena os widgets no dicionário
+                self.product_widgets[excel_row] = {
+                    'text_widget': text_widget,
+                    'price_label': price_label,
+                    'quantity_entry': quantity_entry,
+                    'quantity_var': quantity_var,
+                    'delete_button': delete_button,
+                    'edit_button': edit_button
+                }
+
+
         else:
             # Atualiza widgets existentes
             widgets = self.product_widgets[excel_row]
             widgets['text_widget'].config(state=tk.NORMAL)
             widgets['text_widget'].delete("1.0", tk.END)
-            widgets['text_widget'].insert(tk.END, f"{details['categoria']} - {details['sabor']}")
+            if details['sabor'] == '':
+                widgets['text_widget'].insert(tk.END, f"{details['categoria']}")
+            else:
+                widgets['text_widget'].insert(tk.END, f"{details['categoria']} - {details['sabor']}")
+
             widgets['text_widget'].config(state=tk.DISABLED)
 
             # Atualiza a quantidade
@@ -909,10 +846,15 @@ class POSApplication:
 
         # Atualiza o preço com base na promoção
         widgets = self.product_widgets[excel_row]
-        if (self.sale.payment_method in ['Pix', 'Dinheiro'] and
+
+        #print(self.sale.payment_method in ['Pix', 'Dinheiro'])
+        #print(details['promo_qt'] is not None)
+        #print(self.category_quantities.get(details['categoria'], 0) >= details['promo_qt'])
+
+        if (self.sale.payment_method in ['Pix', 'Dinheiro'] and details['promo_qt'] is not None and
                 self.category_quantities.get(details['categoria'], 0) >= details['promo_qt']):
             price = details['promo_preco']
-            fg_color = "#88ff88"
+            fg_color = "#00ff00"
         else:
             price = details['preco']
             fg_color = "#ffffff"
@@ -923,6 +865,8 @@ class POSApplication:
         final_price = self.sale.apply_promotion()
         self.final_price_label.config(text=f"R${final_price:.2f}")
 
+        self.payment_method_var.set(self.sale.payment_method)
+
         # Calcula quantidades por categoria
         self.category_quantities = {}
         for details in self.sale.current_sale.values():
@@ -932,39 +876,53 @@ class POSApplication:
 
         # Atualiza widgets existentes ou cria novos
         for excel_row in self.sale.current_sale.keys():
-            try:
-                # Buscar os detalhes atualizados do banco de dados
-                product_series = self.product_db.df.loc[excel_row - 3]  # Ajustar para índice do DataFrame
-                details = {
-                    'categoria': product_series[('Todas', 'Categoria')],
-                    'sabor': product_series[('Todas', 'Sabor')],
-                    'preco': float(product_series[(self.sale.shop, 'Preco')]),
-                    'promo_preco': float(product_series[(self.sale.shop, 'Promo Preco')]) if pd.notna(
-                        product_series[(self.sale.shop, 'Promo Preco')]) else float(
-                        product_series[(self.sale.shop, 'Preco')]),
-                    'promo_qt': int(product_series[(self.sale.shop, 'Promo Quantidade')]) if pd.notna(
-                        product_series[(self.sale.shop, 'Promo Quantidade')]) else 1,
-                    'quantidade': self.sale.current_sale[excel_row]['quantidade'],
-                    'indexExcel': excel_row
-                }
-                self.create_or_update_product_widget(excel_row, details)
-            except Exception as e:
-                messagebox.showerror("Erro", f"Erro ao atualizar produto {excel_row}: {e}")
+            #try:
 
-        # Remove widgets que não estão mais na venda
-        existing_excel_rows = set(self.product_widgets.keys())
-        current_excel_rows = set(self.sale.current_sale.keys())
-        for excel_row in existing_excel_rows - current_excel_rows:
-            widgets = self.product_widgets[excel_row]
-            for widget in widgets.values():
-                if isinstance(widget, (tk.Widget, ttk.Widget)):
-                    widget.destroy()
-            del self.product_widgets[excel_row]
+            details = None
+            product_series = None
+
+            #if product is not None and excel_row == product[('Metadata', 'Excel Row')]:
+            #    product_series = product
+            #else:
+            if type(excel_row) != str:
+                product_series = self.product_db.df.loc[excel_row - 3]  # Ajustar para índice do DataFrame
+            else:
+                #Quando ha produtos manualmente adicionados
+                for product in self.manual_add_list:
+                    if excel_row == product[('Metadata', 'Excel Row')]:
+                        product_series = product
+
+
+            details = {
+                'categoria': product_series[('Todas', 'Categoria')],
+                'sabor': product_series[('Todas', 'Sabor')],
+                'preco': float(product_series[(self.sale.shop, 'Preco')]),
+                'promo_preco': float(product_series[(self.sale.shop, 'Promo Preco')]) if pd.notna(
+                    product_series[(self.sale.shop, 'Promo Preco')]) else float(
+                    product_series[(self.sale.shop, 'Preco')]),
+                'promo_qt': int(product_series[(self.sale.shop, 'Promo Quantidade')]) if pd.notna(
+                    product_series[(self.sale.shop, 'Promo Quantidade')]) else None,
+                'quantidade': self.sale.current_sale[excel_row]['quantidade'],
+                'indexExcel': excel_row
+            }
+            self.create_or_update_product_widget(excel_row, details)
+            #except Exception as e:
+            #    messagebox.showerror("Erro", f"Erro ao atualizar produto {excel_row}: {e}")
+
+
 
         # Restaurar o foco no código de barras
         self.root.bind("<Return>", lambda event: (self.barcode_entry.focus(), "break")[1])
-        self.root.bind("<F12>", lambda event: (self.barcode_entry.focus(), "break")[1])
-        self.root.bind("<End>", lambda event: (self.barcode_entry.focus(), "break")[1])
+        self.root.bind("<F12>", lambda event: (self.F12_press_handle(), "break")[1])
+        self.root.bind("<End>", lambda event: (self.F12_press_handle(), "break")[1])
+
+        self.root.bind("<F5>", lambda event: (self.update_payment_method(method = "Débito"), "break")[1])
+        self.root.bind("<F6>", lambda event: (self.update_payment_method(method = "Crédito"), "break")[1])
+        self.root.bind("<F7>", lambda event: (self.update_payment_method(method = "Pix"), "break")[1])
+        self.root.bind("<F8>", lambda event: (self.update_payment_method(method = "Dinheiro"), "break")[1])
+        self.root.bind("<F9>", lambda event: (self.cobrar(), "break")[1])
+        self.root.bind("<F10>", lambda event: (self.new_sale(), "break")[1])
+        self.root.bind("<F11>", lambda event: (self.finalize_sale(internal_id=self.sale.id), "break")[1])
 
         # Se um produto foi passado, focar no widget de quantidade correspondente
         if product is not None:
@@ -975,6 +933,12 @@ class POSApplication:
         if self.valor_pago_entry.get():
             self.calcular_troco()
 
+        self.create_or_update_sale_widgets(self.sale.id)
+
+    def F12_press_handle(self):
+        self.barcode_entry.focus()
+        self.barcode_entry.delete(0, 'end')
+
     def select_all_text(self, event):
         event.widget.select_range(0, 'end')
         event.widget.icursor('end')
@@ -983,10 +947,11 @@ class POSApplication:
     def update_quantity_dynamic(self, index_excel, quantity_var):
         try:
             new_quantity = int(quantity_var.get())
-            if new_quantity < 0:
+            if new_quantity <= 0:
                 new_quantity = 0
-            self.sale.update_quantity(index_excel, new_quantity)
-            # Update only the price label for this product
+                self.delete_product(index_excel)
+            if index_excel in self.sale.current_sale:
+                self.sale.current_sale[index_excel]['quantidade'] = max(new_quantity, 0)
             self.update_sale_display()
         except ValueError:
             if quantity_var.get() != "" :
@@ -995,27 +960,52 @@ class POSApplication:
     def delete_product(self, excel_row):
         self.sale.remove_product(excel_row)
         if excel_row in self.product_widgets:
-            # Destrói todos os widgets associados ao produto
+            # Destroy all widgets associated with the product
             for widget in self.product_widgets[excel_row].values():
                 if isinstance(widget, (tk.Widget, ttk.Widget)):
+                    widget.grid_forget()
                     widget.destroy()
-            # Remove o produto do dicionário
+            # Remove the product from the dictionary
             del self.product_widgets[excel_row]
+
+        # Reindex and reposition remaining widgets
+        for idx, (key, widgets) in enumerate(self.product_widgets.items()):
+            # Update the grid positions for each widget
+            widgets['text_widget'].grid(row=idx, column=0, padx=50, pady=2, sticky="w")
+            widgets['quantity_entry'].grid(row=idx, column=1, padx=5, pady=2)
+            widgets['price_label'].grid(row=idx, column=2, padx=5, pady=2)
+            widgets['delete_button'].grid(row=idx, column=3, padx=5, pady=2)
+            if 'edit_button' in widgets:  # Only for non-manual entries
+                widgets['edit_button'].grid(row=idx, column=4, padx=5, pady=2)
+
         self.update_sale_display()
 
-    def edit_product(self, index_excel):
-        """Abre uma janela para editar as informações do produto no arquivo Excel."""
-        # Encontrar o índice do Excel para este produto
-        excel_row = self.sale.current_sale[index_excel]['indexExcel']
-        product_series = self.product_db.df.loc[excel_row - 3]  # Ajustar para índice do DataFrame
+    def edit_product(self, index_excel=None, barcode=None, prefill_store=None):
 
-        # Obter os dados atuais do produto
-        current_barcode = product_series[('Todas', 'Codigo de Barras')]
-        current_sabor = product_series[('Todas', 'Sabor')]
-        current_categoria = product_series[('Todas', 'Categoria')]
-        current_preco = product_series[(self.sale.shop, 'Preco')]
-        current_promo_preco = product_series[(self.sale.shop, 'Promo Preco')]
-        current_promo_qt = product_series[(self.sale.shop, 'Promo Quantidade')]
+        shop = self.sale.shop if prefill_store is None else prefill_store
+        excel_row = None
+        if index_excel is not None:
+            #excel_row = self.sale.current_sale[index_excel]['indexExcel']
+            excel_row = index_excel
+            product_series = self.product_db.df.loc[excel_row - 3]  # Ajustar para índice do DataFrame
+            # Obter os dados atuais do produto
+            current_barcode = product_series[('Todas', 'Codigo de Barras')]
+            current_sabor = product_series[('Todas', 'Sabor')]
+            current_categoria = product_series[('Todas', 'Categoria')]
+            current_preco = product_series[(shop, 'Preco')]
+            current_promo_preco = product_series[(shop, 'Promo Preco')]
+            current_promo_qt = product_series[(shop, 'Promo Quantidade')]
+
+        else:
+            excel_row = self.product_db.df.index[-1] + 4
+            current_barcode = "" if barcode is None else barcode
+            current_sabor = ""
+            current_categoria = ""
+            current_preco = ""
+            current_promo_preco = ""
+            current_promo_qt = ""
+
+
 
         def save_changes():
             try:
@@ -1058,9 +1048,19 @@ class POSApplication:
                         'sabor': new_sabor,
                         'preco': new_preco_val,
                         'promo_preco': new_promo_preco_val if new_promo_preco_val is not None else new_preco_val,
-                        'promo_qt': new_promo_qt_val if new_promo_qt_val is not None else 1,
+                        'promo_qt': new_promo_qt_val if new_promo_qt_val is not None else None,
                     })
 
+                    details = {
+                        'categoria': new_categoria,
+                        'sabor': new_sabor,
+                        'preco': new_preco_val,
+                        'promo_preco': new_promo_preco_val if new_promo_preco_val is not None else new_preco_val,
+                        'promo_qt': new_promo_qt_val if new_promo_qt_val is not None else None,
+                        'quantidade': self.sale.current_sale[excel_row]['quantidade'],
+                        'indexExcel': excel_row
+                    }
+                    self.create_or_update_product_widget(excel_row, details)
 
                 self.update_sale_display()  # Atualizar a exibição da venda
                 edit_window.destroy()
@@ -1093,45 +1093,54 @@ class POSApplication:
         # Criar a janela de edição
         edit_window = tk.Toplevel(self.root)
         edit_window.title("Editar Produto")
-        edit_window.configure(bg="#1a1a2e")
+        edit_window.configure(bg="#8b0000")
+        edit_window.attributes("-topmost", True)
 
         # Frame para inputs
-        input_frame = tk.Frame(edit_window, bg="#1a1a2e")
+        input_frame = tk.Frame(edit_window, bg="#8b0000")
         input_frame.pack(pady=10, padx=10)
 
         # Código de Barras
-        tk.Label(input_frame, text="Código de Barras:", bg="#1a1a2e", fg="#ffffff").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        barcode_entry = ttk.Entry(input_frame)
+        tk.Label(input_frame, text="Código de Barras:", bg="#8b0000", fg="#ffffff").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        barcode_entry = tk.Entry(input_frame)
         barcode_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
         barcode_entry.insert(0, current_barcode)
 
         # Sabor
-        tk.Label(input_frame, text="Sabor:", bg="#1a1a2e", fg="#ffffff").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        sabor_entry = ttk.Entry(input_frame)
+        tk.Label(input_frame, text="Sabor:", bg="#8b0000", fg="#ffffff").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        sabor_entry = ttk.Combobox(
+            input_frame,
+            values=self.product_db.get_unique_values('Sabor'),
+            state="normal"
+        )
         sabor_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         sabor_entry.insert(0, current_sabor)
 
         # Categoria
-        tk.Label(input_frame, text="Categoria:", bg="#1a1a2e", fg="#ffffff").grid(row=2, column=0, padx=5, pady=5, sticky="e")
-        categoria_entry = ttk.Entry(input_frame)
+        tk.Label(input_frame, text="Categoria:", bg="#8b0000", fg="#ffffff").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        categoria_entry = ttk.Combobox(
+            input_frame,
+            values=self.product_db.get_unique_values('Categoria'),
+            state="normal"
+        )
         categoria_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
         categoria_entry.insert(0, current_categoria)
 
         # Preço
-        tk.Label(input_frame, text="Preço:", bg="#1a1a2e", fg="#ffffff").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Preço:", bg="#8b0000", fg="#ffffff").grid(row=3, column=0, padx=5, pady=5, sticky="e")
         preco_entry = ttk.Entry(input_frame)
         preco_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
         preco_entry.insert(0, current_preco)
 
         # Promo Preço
-        tk.Label(input_frame, text="Promo Preço:", bg="#1a1a2e", fg="#ffffff").grid(row=4, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Promo Preço:", bg="#8b0000", fg="#ffffff").grid(row=4, column=0, padx=5, pady=5, sticky="e")
         promo_preco_entry = ttk.Entry(input_frame)
         promo_preco_entry.grid(row=4, column=1, padx=5, pady=5, sticky="w")
         if pd.notna(current_promo_preco):
             promo_preco_entry.insert(0, current_promo_preco)
 
         # Promo Quantidade
-        tk.Label(input_frame, text="Promo Quantidade:", bg="#1a1a2e", fg="#ffffff").grid(row=5, column=0, padx=5, pady=5, sticky="e")
+        tk.Label(input_frame, text="Promo Quantidade:", bg="#8b0000", fg="#ffffff").grid(row=5, column=0, padx=5, pady=5, sticky="e")
         promo_qt_entry = ttk.Entry(input_frame)
         promo_qt_entry.grid(row=5, column=1, padx=5, pady=5, sticky="w")
         if pd.notna(current_promo_qt):
@@ -1149,18 +1158,35 @@ class POSApplication:
                 self.troco_label.config(text=f"Troco: R${troco:.2f}", foreground="#ff5555")
             else:
                 self.troco_label.config(text=f"Troco: R${troco:.2f}", foreground="#55ff55")
-            self.sugestao_troco_label.config(text="")
         except ValueError:
             self.troco_label.config(text="")
-            self.sugestao_troco_label.config(text="")
 
-    def finalize_sale(self):
-        if not self.sale.current_sale:
+    def finalize_sale(self, internal_id):
+        def process_sale():  # Define the threaded process
+            # Load or create sales history
+            try:
+                sales_history = pd.read_excel('Historico_vendas.xlsx')
+            except FileNotFoundError:
+                sales_history = pd.DataFrame(
+                    columns=['Data', 'Horario', 'Preco Final', 'Metodo de pagamento', 'Produtos',
+                             'Quantidade de produtos']
+                )
+
+            # Append new sale
+            updated_sales_history = pd.concat([sales_history, sale_df], ignore_index=True)
+            updated_sales_history.to_excel('Historico_vendas.xlsx', index=False)
+
+            #print(f"Time taken for finalize_sale: {time.time() - start_time:.2f} seconds")
+
+        start_time = time.time()  # Record the start time
+        sale = next((sale for sale in self.stored_sales if sale.id == internal_id), None)
+
+        if not sale.current_sale:
             messagebox.showerror("Erro", "Sem produtos nas vendas!")
             return
 
         # Apply promotion and calculate final price
-        final_price = self.sale.apply_promotion()
+        final_price = sale.apply_promotion()
 
         # Save sale details
         now = datetime.now()
@@ -1168,45 +1194,604 @@ class POSApplication:
             'Data': [now.strftime('%Y-%m-%d')],
             'Horario': [now.strftime('%H:%M:%S')],
             'Preco Final': [final_price],
-            'Metodo de pagamento': [self.sale.payment_method],
-            'Produtos': [self.sale.current_sale],
-            'Quantidade de produtos': [sum(product['quantidade'] for product in self.sale.current_sale.values())]
+            'Metodo de pagamento': [sale.payment_method],
+            'Produtos': [sale.current_sale],
+            'Quantidade de produtos': [sum(product['quantidade'] for product in sale.current_sale.values())]
         }
         sale_df = pd.DataFrame(sale_data)
+        threading.Thread(target=process_sale).start()
+        self.delete_stored_sale(sale.id)
 
-        # Load or create sales history
-        try:
-            sales_history = pd.read_excel('Historico_vendas.xlsx')
-        except FileNotFoundError:
-            sales_history = pd.DataFrame(
-                columns=['Data', 'Horario', 'Preco Final', 'Metodo de pagamento', 'Produtos', 'Quantidade de produtos']
-            )
+        #print(f"Time taken for creating new sale: {time.time() - start_time :.2f} seconds")
 
-        # Append new sale
-        updated_sales_history = pd.concat([sales_history, sale_df], ignore_index=True)
-        updated_sales_history.to_excel('Historico_vendas.xlsx', index=False)
+    def new_sale(self, sale_= None):
+        # Reset the sale object
+        if sale_ is None:
+            self.sale = Sale(self.product_db, self.selected_shop_var.get(), payment_method="")
+        else:
+            self.sale = sale_
 
-        # Reset sale
-        self.new_sale()
+        # Clear all widgets from the sale frame
+        for widget in self.sale_frame.winfo_children():
+            widget.grid_forget()
+            widget.destroy()
 
-    def new_sale(self):
-        self.sale = Sale(self.product_db, self.selected_shop_var.get(), self.payment_method_var.get())
-        self.update_sale_display()
-        self.payment_method_var.set("Débito")
+        # Clear the product widgets dictionary
+        self.product_widgets.clear()
+
+        # Reset other UI elements
+        self.payment_method_var.set("")
         self.valor_pago_entry.delete(0, 'end')
         self.troco_label.config(text="")
-        self.sugestao_troco_label.config(text="")
+        self.update_status("")
+        self.barcode_entry.delete(0, 'end')
 
-        # Clear product widgets
-        for widgets in self.product_widgets.values():
-            for widget in widgets.values():
-                if isinstance(widget, (tk.Widget, ttk.Widget)):  # Destrói apenas widgets Tkinter
-                    widget.destroy()
-        self.product_widgets.clear()
+        # Refresh the display
+        self.update_sale_display()
+
+    def create_or_update_sale_widgets(self, id):
+        if id not in [sale.id for sale in self.stored_sales]:
+            self.stored_sales.append(self.sale)
+
+            col = len(self.stored_sales)
+
+            text_button = tk.Button(
+                self.stored_sale_frame, text=f"R${self.sale.final_price:.2f}",
+                font=("Arial", 18, "bold"), bg="#1a1a2e", fg="#ffffff",
+                anchor="w",
+                bd=0, highlightthickness=0,
+                command=lambda id_=id: self.open_sale(id_)
+            )
+            text_button.tag = id
+            text_button.grid(row=0, column=col, padx=int(60 * self.scale_factor), pady=0, sticky="w")
+
+            # Botão de remover
+            delete_button = tk.Button(
+                self.stored_sale_frame, text="✖",
+                command=lambda id_=id: self.delete_stored_sale(id_),
+                bg="#1a1a2e", fg="#ffffff", font=("Arial", int(16 * self.scale_factor)),
+                borderwidth=0
+            )
+            delete_button.tag = id
+            delete_button.grid(row=0, column=col, padx=int(18 * self.scale_factor), pady=0, stick="e")
+
+
+        for widget in self.stored_sale_frame.winfo_children():
+            if getattr(widget, "tag", None) == id and widget['text'] != "✖":
+                widget['text'] = f"R${self.sale.final_price:.2f}"
+                widget['font'] = ("Arial", 22, "bold")
+            else:
+                widget['font'] = ("Arial", 18)
+
+    def delete_stored_sale(self, id):
+
+        # Find and remove the sale from the stored sales list
+        sale_to_remove = next((sale for sale in self.stored_sales if sale.id == id), None)
+        if sale_to_remove:
+            self.stored_sales.remove(sale_to_remove)
+
+            # Iterate through the widgets in the stored_sale_frame
+            for widget in self.stored_sale_frame.winfo_children():
+                # Compare the tag of the widget (which stores the sale's ID)
+                if hasattr(widget, "tag") and widget.tag == id:
+                    widget.grid_forget()  # Remove the widget from the layout
+                    widget.destroy()  # Destroy the widget
+
+
+
+        for sale in self.stored_sales:
+            if sale.final_price == 0.00:
+                self.open_sale(sale.id)
+                self.rearrange_sale_widgets()
+                return
+
+        if self.sale.id == id:
+            self.new_sale()
+        self.rearrange_sale_widgets()
+
+    def rearrange_sale_widgets(self):
+        # Reorganize remaining sale buttons if necessary
+        for col, widget in enumerate(self.stored_sale_frame.winfo_children()):
+            if widget["text"] != "✖":
+                widget.grid_configure(column=col)
+            else:
+                widget.grid_configure(column=col-1)
+
+    def open_sale(self, id):
+        sale = next((sale for sale in self.stored_sales if sale.id == id), None)
+        if sale:
+            self.new_sale(sale)
+            self.update_sale_display()
 
     def close_application(self):
         self.root.quit()
+        self.root.destroy()
 
+    def cobrar(self):
+        final_price = self.sale.apply_promotion()
+        if final_price >= 1.00:
+            self.payment(pay_amount=final_price, payment_type=self.sale.payment_method, internal_id=self.sale.id)
+
+    def create_payment_intent_card(self, amount, internal_id):
+
+        url = "https://api.mercadopago.com/point/integration-api/devices/" + config.device + "/payment-intents"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "amount": amount * 100,
+            "description": "Lolla sorveteria",
+            "additional_info": {
+                "external_reference": internal_id,
+                "print_on_terminal": True
+            }
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+
+    def create_payment_intent_debit(self, amount, internal_id):
+
+        url = "https://api.mercadopago.com/point/integration-api/devices/" + config.device + "/payment-intents"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "amount": amount * 100,
+            "description": "Lolla sorveteria",
+            "payment": {
+                "type": "debit_card"
+            },
+            "additional_info": {
+                "external_reference": internal_id,
+                "print_on_terminal": True
+            }
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+
+    def create_payment_intent_credit(self, amount, internal_id):
+
+        url = "https://api.mercadopago.com/point/integration-api/devices/" + config.device + "/payment-intents"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "amount": amount * 100,
+            "description": "Lolla sorveteria",
+            "payment": {
+                "installments": 1,
+                "installments_cost": "seller",
+                "type": "credit_card"
+            },
+            "additional_info": {
+                "external_reference": internal_id,
+                "print_on_terminal": True
+            }
+        }
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+
+    def create_payment_intent_pix(self, amount, internal_id):
+        url = "https://api.mercadopago.com/instore/orders/qr/seller/collectors/" + config.user_id + "/pos/" + config.pos_name + "/qrs"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "external_reference": internal_id,
+            "title": "Product order",
+            "description": "Purchase description.",
+            "total_amount": amount,
+            "items": [
+                {
+                    "title": "Lolla Sorveteria",
+                    "unit_price": amount,
+                    "quantity": 1,
+                    "unit_measure": "unit",
+                    "total_amount": amount
+                }
+            ]
+        }
+        try:
+            response = requests.put(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+
+    def confirm_payment_card(self, payment_intent_id):
+
+        url = f"https://api.mercadopago.com/point/integration-api/payment-intents/{payment_intent_id}"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+
+    def confirm_payment_pix(self):
+
+        url = "https://api.mercadopago.com/instore/qr/seller/collectors/" + config.user_id + "/pos/" + config.pos_name + "/orders"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+            "Content-Type": "application/json"
+        }
+
+        try:
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            return {"error": str(e)}
+
+    def delete_pix(self):
+
+        url = "https://api.mercadopago.com/instore/qr/seller/collectors/" + config.user_id + "/pos/" + config.pos_name + "/orders"
+        headers = {
+            "Authorization": "Bearer " + config.id_token,
+            "Content-Type": "application/json"
+        }
+
+        try:
+            response = requests.delete(url, headers=headers)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"error {str(e)}")
+
+    def wait_for_payment_to_finish_card(self, payment_intent_id, internal_id, poll_interval=1):
+
+        while True:
+            response = self.confirm_payment_card(payment_intent_id)
+            if "state" in response:
+                state = response["state"]
+                self.update_status(state)
+
+                print(f"Payment state: {state}")
+                # if state in ["OPEN", "ON_TERMINAL", "PROCESSING"]:  # Adjust as per terminal state
+                if state == "FINISHED":
+                    payment_id = response.get("id")
+                    print(f"Payment approved with ID: {payment_id}")
+                    self.finalize_sale(internal_id)
+                    return payment_id
+
+                if state == "CANCELED" or state == "ABANDONED":
+                    payment_id = response.get("id")
+                    print(state)
+                    print(f"Payment canceled/abandoned with ID: {payment_id}")
+                    return payment_id
+            else:
+                print(f"Error checking payment state: {response.get('error', 'Unknown error')}")
+            time.sleep(poll_interval)
+
+    def wait_for_payment_to_finish_pix(self, internal_id, qr_window, poll_interval=1):
+
+        while True:
+            response = self.confirm_payment_pix()
+            # print("response::")
+            # print(response)
+            if "external_reference" in response:
+                external_reference_ = response["external_reference"]
+                if internal_id != external_reference_:
+                    print(f"{external_reference_} != {internal_id}")
+                    return external_reference_
+                else:
+                    time.sleep(poll_interval)
+            else:
+                print(f"Payment finished with external_reference {internal_id}")
+                qr_window.destroy()  # Close the QR code window
+                self.finalize_sale(internal_id)
+                return
+
+    def display_qr_code(self, qr_data, internal_id):
+        # Generate the QR code
+        self.update_status("Gerando QR")
+
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=int(10 * self.scale_factor),  # Adjust box size
+            border=4
+        )
+        qr.add_data(qr_data)
+        qr.make()
+
+        win_width = int(1000 * self.scale_factor)
+        win_height = int(1000 * self.scale_factor)
+        qr_width = int(900 * self.scale_factor)
+        qr_height = int(900 * self.scale_factor)
+
+        # Create an image of the QR code
+        img = qr.make_image(fill_color="black", back_color="white")
+        img = img.resize((qr_width, qr_height), Image.Resampling.LANCZOS)  # Updated resizing method
+        qr_photo = ImageTk.PhotoImage(img)
+
+        # Create a new Tkinter window for the QR code
+        qr_window = tk.Toplevel(self.root)
+        qr_window.title("Scan QR Code")
+        qr_window.configure(bg="#8b0000")
+        qr_window.attributes("-topmost", True)
+
+        # Set the window size and make it modal
+        qr_window.geometry(f"{win_width}x{win_height}")
+        qr_window.resizable(False, False)
+        qr_window.grab_set()  # Make the window modal
+
+        # Add the QR code image to the window
+        qr_label = tk.Label(qr_window, image=qr_photo, bg="#8b0000")
+        qr_label.image = qr_photo  # Keep a reference to avoid garbage collection
+        qr_label.pack(expand=True)
+
+        self.update_status("Aguardando pagamento")
+
+        # Wait for payment in a separate thread to prevent UI freezing
+        threading.Thread(
+            target=self.wait_for_payment_to_finish_pix,
+            args=(internal_id, qr_window),
+            daemon=True
+        ).start()
+
+    def update_status(self, new_status):
+        if new_status == "OPEN":
+            new_status = "Em aberto"
+        if new_status == "FINISHED":
+            new_status = "Finalizado"
+        if new_status == "ON_TERMINAL":
+            new_status = "Na maquininha"
+        if new_status == "CANCELED":
+            new_status = "Cancelada"
+        if new_status == "PROCESSING":
+            new_status = "Processando"
+
+        self.status_label.configure(text=f"{new_status}")
+
+    def update_status_thread(self, pay_amount, internal_id):
+        # Update the status first before waiting
+        self.update_status("Obtendo QR")
+        self.delete_pix()
+        response = self.create_payment_intent_pix(amount=pay_amount, internal_id=id)
+
+        if "in_store_order_id" in response:
+            # After waiting, update status again
+            qr = response["qr_data"]
+            self.display_qr_code(qr, internal_id)
+        else:
+            print("Failed to create payment intent.")
+            self.update_status("Falha")
+
+    def payment(self, pay_amount, payment_type, internal_id):
+        self.update_status("Iniciando pagamento")
+
+
+        if payment_type == "":
+            response = self.create_payment_intent_card(amount=pay_amount, internal_id=internal_id)
+            print(response)
+
+            if "id" in response:
+                payment_intent_id = response["id"]
+
+                threading.Thread(
+                    target=self.wait_for_payment_to_finish_card,
+                    args=(payment_intent_id, internal_id,),
+                    daemon=True
+                ).start()
+            else:
+                print("Failed to create payment intent.")
+                self.update_status("Falha")
+
+        if payment_type == "Débito":
+            response = self.create_payment_intent_debit(amount=pay_amount, internal_id=internal_id)
+            print(response)
+
+            if "id" in response:
+                payment_intent_id = response["id"]
+
+                threading.Thread(
+                    target=self.wait_for_payment_to_finish_card,
+                    args=(payment_intent_id, internal_id,),
+                    daemon=True
+                ).start()
+            else:
+                print("Failed to create payment intent.")
+                self.update_status("Falha")
+
+        elif payment_type == "Crédito":
+            response = self.create_payment_intent_credit(amount=pay_amount, internal_id=internal_id)
+            print(response)
+
+            if "id" in response:
+                payment_intent_id = response["id"]
+                threading.Thread(
+                    target=self.wait_for_payment_to_finish_card,
+                    args=(payment_intent_id, internal_id,),
+                    daemon=True
+                ).start()
+            else:
+                print("Failed to create payment intent.")
+                self.update_status("Falha")
+
+        elif payment_type == "Pix":
+            # Run the sleep and update status in a separate thread
+            threading.Thread(target=self.update_status_thread, args=(pay_amount, id,), daemon=True).start()
+
+class ToolTip:
+    def __init__(self, widget):
+        self.widget = widget
+        self.tooltip = None
+        self.current_item = None  # Track the currently hovered item
+        self.widget.bind("<Motion>", self.on_motion)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+
+    def on_motion(self, event):
+        # Check if the mouse is over a valid item
+        item = self.widget.identify_row(event.y)
+        if item != self.current_item:  # Only update if the hovered item changes
+            self.current_item = item
+            if item:
+                # Get the 'Produtos' value for the hovered item
+                produtos = self.widget.item(item, 'values')[4]
+                if produtos:
+                    try:
+                        # Safely evaluate the string into a dictionary
+                        produtos_dict = self.safe_eval_produtos(produtos)
+
+                        # Format the products into a readable list
+                        formatted_products = self.format_products(produtos_dict)
+
+                        # Get the position of the mouse
+                        bbox = self.widget.bbox(item)
+                        if bbox:  # Check if the bounding box is valid
+                            x, y, _, _ = bbox
+                            x += self.widget.winfo_rootx() + 25
+                            y += self.widget.winfo_rooty() + 25
+
+                            # Update or create the tooltip
+                            if self.tooltip:
+                                # Update the existing tooltip
+                                self.tooltip.wm_geometry(f"+{x}+{y}")
+                                self.tooltip_label.config(text=formatted_products)
+                            else:
+                                # Create the tooltip window
+                                self.tooltip = tk.Toplevel(self.widget)
+                                self.tooltip.wm_overrideredirect(True)
+                                self.tooltip.wm_geometry(f"+{x}+{y}")
+
+                                # Add a label to display the formatted products
+                                self.tooltip_label = tk.Label(self.tooltip, text=formatted_products, background="#ffffe0", relief="solid", borderwidth=1, justify=tk.LEFT)
+                                self.tooltip_label.pack()
+                    except Exception as e:
+                        print(f"Error formatting products: {e}")
+            else:
+                # Hide the tooltip if the mouse is not over a valid item
+                self.hide_tooltip()
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+            self.current_item = None  # Reset the current item
+
+    def safe_eval_produtos(self, produtos):
+        # Define a safe namespace for evaluation
+        safe_namespace = {
+            "np": np,  # Allow numpy functions
+            "int": int,  # Allow Python int
+            "float": float,  # Allow Python float
+            "nan": np.nan,  # Allow numpy nan
+        }
+
+        # Evaluate the string in the safe namespace
+        return eval(produtos, {"__builtins__": {}}, safe_namespace)
+
+    def format_products(self, produtos_dict):
+        # Format the dictionary into a readable list
+        formatted_text = "Produtos:\n"
+        for product_id, details in produtos_dict.items():
+            # Handle None or nan values in the dictionary
+            for key, value in details.items():
+                if value is None or (isinstance(value, float) and math.isnan(value)):
+                    details[key] = "N/A"
+
+            # Format the price with R$ and two decimal places
+            preco = details['preco']
+            if isinstance(preco, (int, float)):
+                preco = f"R${preco:.2f}"
+            else:
+                preco = "R$0.00"
+
+            formatted_text += (
+                f"- {details['categoria']} ({details['sabor']}): "
+                f"{details['quantidade']} unidade(s) a {preco}\n"
+            )
+        return formatted_text
+class SalesHistoryWindow:
+    def __init__(self, parent):
+        self.parent = parent
+        self.window = tk.Toplevel(parent)
+        self.window.title("Histórico de Vendas")
+        self.window.geometry("800x600")
+
+        # Create a frame to hold the Treeview and scrollbars
+        self.tree_frame = tk.Frame(self.window)
+        self.tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Create a Treeview widget
+        self.tree = ttk.Treeview(
+            self.tree_frame,
+            columns=('Data', 'Horario', 'Preco Final', 'Metodo de pagamento', 'Produtos'),
+            show='headings'
+        )
+        self.tree.heading('Data', text='Data')
+        self.tree.heading('Horario', text='Horário')
+        self.tree.heading('Preco Final', text='Preço Final')
+        self.tree.heading('Metodo de pagamento', text='Método de Pagamento')
+
+        # Hide the 'Produtos' column
+        self.tree['displaycolumns'] = ('Data', 'Horario', 'Preco Final', 'Metodo de pagamento')
+
+        # Set column widths
+        self.tree.column('Data', width=100, anchor=tk.CENTER)
+        self.tree.column('Horario', width=100, anchor=tk.CENTER)
+        self.tree.column('Preco Final', width=100, anchor=tk.CENTER)
+        self.tree.column('Metodo de pagamento', width=150, anchor=tk.CENTER)
+
+        # Add vertical scrollbar
+        self.v_scroll = ttk.Scrollbar(self.tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=self.v_scroll.set)
+        self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.pack(fill=tk.BOTH, expand=True)
+
+        # Bind hover event to show products
+        self.tooltip = ToolTip(self.tree)
+
+        # Load and display sales history
+        self.load_sales_history()
+
+    def load_sales_history(self):
+        try:
+            sales_history = pd.read_excel('Historico_vendas.xlsx')
+            # Sort by 'Data' and 'Horario' in descending order to show the latest sales first
+            sales_history = sales_history.sort_values(by=['Data', 'Horario'], ascending=[False, False])
+
+            # Replace 'nan' in 'Metodo de pagamento' with an empty string
+            sales_history['Metodo de pagamento'] = sales_history['Metodo de pagamento'].replace({np.nan: ""})
+
+            for _, row in sales_history.iterrows():
+                # Format the 'Preco Final' with R$ and two decimal places
+                preco_final = row['Preco Final']
+                if isinstance(preco_final, (int, float)):
+                    preco_final = f"R${preco_final:.2f}"
+                else:
+                    preco_final = "R$0.00"
+
+                self.tree.insert('', 'end', values=(
+                    row['Data'],
+                    row['Horario'],
+                    preco_final,
+                    row['Metodo de pagamento'],
+                    row['Produtos']
+                ))
+        except FileNotFoundError:
+            messagebox.showerror("Erro", "Arquivo de histórico de vendas não encontrado!")
 
 if __name__ == "__main__":
     root = tk.Tk()
