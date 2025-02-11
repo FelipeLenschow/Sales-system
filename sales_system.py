@@ -14,6 +14,7 @@ import threading
 import time
 import numpy as np
 import math
+import unicodedata
 
 import config
 
@@ -21,7 +22,7 @@ import config
 # Constants for UI scaling
 BASE_WIDTH = 1920
 BASE_HEIGHT = 1080
-Version = "0.3.1"
+Version = "0.3.2"
 
 def is_numlock_on():
     if platform.system() != 'Windows':
@@ -569,12 +570,19 @@ class POSApplication:
     def open_sales_history(self):
         SalesHistoryWindow(self.root)
 
+    def strip_accents(self, text):
+        text = unicodedata.normalize('NFD', text) \
+            .encode('ascii', 'ignore') \
+            .decode("utf-8")
+
+        return str(text)
+
     def search_products(self, event=None, force_search=False):
         search_term = self.barcode_entry.get()
 
         if not search_term.isdigit() or force_search:
             if search_term:
-                search_term = search_term.lower()
+                search_term = self.strip_accents(search_term.lower())
                 shop = self.selected_shop_var.get()
 
                 if ',' in search_term:
@@ -695,7 +703,7 @@ class POSApplication:
 
                 self.manual_add_list.append(product)
                 self.sale.add_product(product)
-                self.update_sale_display()
+                self.update_sale_display(focus_on_=product)
                 self.barcode_entry.delete(0, 'end')
                 return
             except Exception:
@@ -739,7 +747,7 @@ class POSApplication:
                 # Apenas um produto encontrado na loja atual, adiciona diretamente
                 product = matching_products.iloc[0]
                 self.sale.add_product(product)
-                self.update_sale_display()
+                self.update_sale_display(focus_on_=product)
             else:
                 # Múltiplos produtos encontrados na loja atual, abrir seleção
                 self.search_products(force_search=True)
@@ -860,7 +868,7 @@ class POSApplication:
             fg_color = "#ffffff"
         widgets['price_label'].config(text=f"R${price:.2f}", fg=fg_color)
 
-    def update_sale_display(self, product=None):
+    def update_sale_display(self, focus_on_=None):
         # Aplica promoções e calcula o preço final
         final_price = self.sale.apply_promotion()
         self.final_price_label.config(text=f"R${final_price:.2f}")
@@ -925,8 +933,8 @@ class POSApplication:
         self.root.bind("<F11>", lambda event: (self.finalize_sale(internal_id=self.sale.id), "break")[1])
 
         # Se um produto foi passado, focar no widget de quantidade correspondente
-        if product is not None:
-            excel_row = product[('Metadata', 'Excel Row')]
+        if focus_on_ is not None:
+            excel_row = focus_on_[('Metadata', 'Excel Row')]
             if excel_row in self.product_widgets:
                 self.product_widgets[excel_row]['quantity_entry'].focus_set()
 
@@ -1010,12 +1018,12 @@ class POSApplication:
         def save_changes():
             try:
                 # Obter e limpar os valores dos campos
-                new_barcode = barcode_entry.get().strip()
-                new_sabor = sabor_entry.get().strip()
-                new_categoria = categoria_entry.get().strip()
-                new_preco = preco_entry.get().strip()
-                new_promo_preco = promo_preco_entry.get().strip()
-                new_promo_qt = promo_qt_entry.get().strip()
+                new_barcode = self.strip_accents(barcode_entry.get().strip()).capitalize()
+                new_sabor = self.strip_accents(sabor_entry.get().strip()).capitalize()
+                new_categoria = self.strip_accents(categoria_entry.get().strip()).capitalize()
+                new_preco = self.strip_accents(preco_entry.get().strip()).capitalize()
+                new_promo_preco = self.strip_accents(promo_preco_entry.get().strip()).capitalize()
+                new_promo_qt = self.strip_accents(promo_qt_entry.get().strip()).capitalize()
 
                 # Validação dos campos obrigatórios
                 if not all([new_barcode, new_sabor, new_categoria, new_preco]):
